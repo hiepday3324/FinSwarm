@@ -1,0 +1,10 @@
+paths:
+  raw: data/raw
+  parquet: data/parquet
+  duckdb: data/duckdb
+  sqlite: data/sqlite
+  faiss: data/faiss
+  event_store: data/event_store
+  checkpoints: data/checkpoints
+  model_artifacts: data/model_artifacts
+  reports: data/reports

@@ -1,0 +1,9 @@
+text_encoder:
+  provider: pretrained
+  embedding_dim: 384
+
+graph:
+  type: correlation
+
+fusion:
+  mode: gated

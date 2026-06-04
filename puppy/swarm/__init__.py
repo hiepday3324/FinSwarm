@@ -1,0 +1,1 @@
+"""Sector-agent swarm runtime."""

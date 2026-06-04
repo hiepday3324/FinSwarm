@@ -1,0 +1,5 @@
+experiment:
+  seed: 42
+  initial_cash: 1000000
+  max_weight_per_asset: 0.35
+  transaction_cost_bps: 5

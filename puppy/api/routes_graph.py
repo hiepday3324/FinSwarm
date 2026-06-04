@@ -1,0 +1,1 @@
+"""Graph observation API routes."""

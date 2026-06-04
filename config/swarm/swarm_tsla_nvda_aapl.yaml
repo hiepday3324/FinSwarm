@@ -1,0 +1,15 @@
+run:
+  run_id: swarm_tsla_nvda_aapl
+  start_date: "2022-08-16"
+  end_date: "2022-10-04"
+
+assets:
+  symbols:
+    - TSLA
+    - NVDA
+    - AAPL
+
+paths:
+  data_config: config/swarm/data_config.yaml
+  model_config: config/swarm/model_config.yaml
+  experiment_config: config/swarm/experiment_config.yaml
