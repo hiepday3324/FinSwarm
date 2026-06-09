@@ -148,3 +148,86 @@ class DebateVerdict(SwarmBaseModel):
     reason: str
     transcript: DebateTranscript
     target_decision: Decision | str | None = None
+
+
+# --- Milestone 2 Additions ---
+
+class PriceBar(SwarmBaseModel):
+    symbol: str
+    date: dt.date
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float
+    adj_close: float | None = None
+    volume: float | int | None = None
+    source: str | None = None
+
+
+class NewsEvent(SwarmBaseModel):
+    event_id: str
+    symbol: str
+    published_at: dt.datetime
+    available_at: dt.datetime
+    title: str | None = None
+    text: str
+    source: str | None = None
+    url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class FilingEvent(SwarmBaseModel):
+    filing_id: str
+    symbol: str
+    filing_type: str
+    filing_date: dt.date
+    accepted_at: dt.datetime | None = None
+    available_at: dt.datetime
+    text: str
+    source: str | None = None
+    url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MarketStep(SwarmBaseModel):
+    date: dt.date
+    symbols: list[str]
+    prices: dict[str, PriceBar]
+    news: dict[str, list[NewsEvent]] = Field(default_factory=dict)
+    filings: dict[str, list[FilingEvent]] = Field(default_factory=dict)
+    as_of: dt.datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class QuantFeatureTable(SwarmBaseModel):
+    date: dt.date
+    symbols: list[str]
+    action_signals: dict[str, int]
+    returns: dict[str, float | None]
+    labels: dict[str, int | float | None] = Field(default_factory=dict)
+    features: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ShadowPortfolioState(SwarmBaseModel):
+    date: dt.date
+    agent_id: str
+    symbol: str
+    value: float
+    roi: float
+    rolling_return: float | None = None
+    sharpe: float | None = None
+    drawdown: float | None = None
+    win_rate: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PortfolioSnapshot(SwarmBaseModel):
+    date: dt.date
+    cash: float
+    positions: dict[str, float]
+    weights: dict[str, float]
+    equity: float
+    daily_return: float | None = None
+    drawdown: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
