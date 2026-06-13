@@ -209,6 +209,35 @@ class QuantFeatureTable(SwarmBaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class GraphOutput(SwarmBaseModel):
+    date: dt.date
+    symbols: list[str]
+    node_features: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    adjacency: dict[str, dict[str, float]] = Field(default_factory=dict)
+    graph_scores: dict[str, float] = Field(default_factory=dict)
+    attention: dict[str, dict[str, float]] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class FusionOutput(SwarmBaseModel):
+    date: dt.date
+    symbols: list[str]
+    text_scores: dict[str, float] = Field(default_factory=dict)
+    graph_scores: dict[str, float] = Field(default_factory=dict)
+    fusion_scores: dict[str, float] = Field(default_factory=dict)
+    gates: dict[str, float] = Field(default_factory=dict)
+    conflict_flags: dict[str, bool] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AllocationWeights(SwarmBaseModel):
+    date: dt.date
+    weights: dict[str, float]
+    cash_weight: float = 0.0
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ShadowPortfolioState(SwarmBaseModel):
     date: dt.date
     agent_id: str

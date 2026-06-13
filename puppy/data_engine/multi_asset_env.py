@@ -25,11 +25,18 @@ class MultiAssetEnvironment:
         self.market_store.connect()
         if not self.symbols:
             return []
-        
-        symbols_str = ", ".join(f"'{s}'" for s in self.symbols)
-        query = f"SELECT DISTINCT date FROM prices WHERE symbol IN ({symbols_str}) ORDER BY date"
-        rows = self.market_store.conn.execute(query).fetchall()
-        return [row[0] if isinstance(row[0], dt.date) else row[0].date() for row in rows]
+        if hasattr(self.market_store, "list_dates"):
+            return list(self.market_store.list_dates(self.symbols))
+
+        rows = self.market_store.conn.execute(
+            "SELECT DISTINCT date FROM prices ORDER BY date"
+        ).fetchall()
+        symbol_set = set(self.symbols)
+        return [
+            row[0] if isinstance(row[0], dt.date) else row[0].date()
+            for row in rows
+            if len(row) < 2 or row[1] in symbol_set
+        ]
 
     def get_market_step(self, date: dt.date, as_of: dt.datetime | None = None) -> MarketStep:
         """Retrieve the market step for a specific date."""
@@ -38,13 +45,13 @@ class MultiAssetEnvironment:
     def step(self, date: dt.date | None = None, as_of: dt.datetime | None = None) -> MarketStep:
         """Advance the environment by one step or query a specific date."""
         if date is not None:
-            # If an explicit date is provided, find it in our list and set the index
-            if date in self.dates:
-                self.current_index = self.dates.index(date)
+            if date not in self.dates:
+                raise ValueError(f"Requested date {date} is outside the simulation dates.")
+            self.current_index = self.dates.index(date)
             return self.get_market_step(date, as_of=as_of)
             
         if self.current_index >= len(self.dates):
-            raise IndexError("Environment simulation has ended. Please reset().")
+            raise IndexError("Environment simulation has ended; call reset() before stepping again.")
             
         current_date = self.dates[self.current_index]
         step_data = self.get_market_step(current_date, as_of=as_of)

@@ -60,12 +60,14 @@ class MemoryVectorService:
         # Fetch double the top_k elements from FAISS to allow filtering room
         faiss_results = self.faiss_store.search(query_text, top_k=top_k * 2)
         if not faiss_results:
-            return []
+            return self.sqlite_store.search_metadata(as_of=as_of, limit=top_k)
             
         vector_ids = [res["vector_id"] for res in faiss_results]
         
         # Fetch metadata records
         sqlite_records = self.sqlite_store.get_by_vector_ids(vector_ids)
+        if not sqlite_records:
+            return self.sqlite_store.search_metadata(as_of=as_of, limit=top_k)
         
         # Map back to FAISS scores and filter by time
         res_map = {res["vector_id"]: res for res in faiss_results}
