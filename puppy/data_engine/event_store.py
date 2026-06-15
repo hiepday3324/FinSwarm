@@ -7,6 +7,8 @@ import uuid
 from collections.abc import Iterator
 from typing import Any
 
+from puppy.common.schemas import AgentOutput, TextFeature
+
 
 def _json_default(value: Any) -> Any:
     if isinstance(value, (dt.date, dt.datetime)):
@@ -51,6 +53,22 @@ class EventStore:
         with open(self.path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, default=_json_default, sort_keys=True) + "\n")
         return event
+
+    def append_agent_output(
+        self,
+        date: dt.date | str,
+        agent_output: AgentOutput,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event("AgentOutput", date, agent_output, metadata=metadata)
+
+    def append_text_feature(
+        self,
+        date: dt.date | str,
+        text_feature: TextFeature,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event("TextFeature", date, text_feature, metadata=metadata)
 
     def read_events(
         self,

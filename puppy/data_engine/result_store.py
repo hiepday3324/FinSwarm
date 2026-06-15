@@ -3,7 +3,12 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from puppy.common.schemas import PortfolioSnapshot, QuantFeatureTable
+from puppy.common.schemas import (
+    AgentOutput,
+    PortfolioSnapshot,
+    QuantFeatureTable,
+    TextFeature,
+)
 
 from .event_store import EventStore
 
@@ -28,6 +33,22 @@ class ResultStore:
         return [
             QuantFeatureTable(**payload)
             for payload in self.read_artifacts("QuantFeatureTable", date=date)
+        ]
+
+    def read_agent_outputs(
+        self, date: dt.date | str | None = None
+    ) -> list[AgentOutput]:
+        return [
+            AgentOutput(**payload)
+            for payload in self.read_artifacts("AgentOutput", date=date)
+        ]
+
+    def read_text_features(
+        self, date: dt.date | str | None = None
+    ) -> list[TextFeature]:
+        return [
+            TextFeature(**payload)
+            for payload in self.read_artifacts("TextFeature", date=date)
         ]
 
     def read_portfolio_snapshots(
