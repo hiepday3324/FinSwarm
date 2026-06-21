@@ -1,4 +1,5 @@
-from datetime import date
+import json
+from datetime import date, datetime
 from typing import Any
 
 from puppy.common.enums import MemoryLayer
@@ -68,9 +69,9 @@ def build_raw_context(context: AgentContext) -> str:
     ]
     sections.append(_format_text_list("Shared context", shared_text))
     if context.shadow_state is not None:
-        sections.append(f"Shadow state:\n{context.shadow_state}")
+        sections.append(_format_structured("Shadow state", context.shadow_state))
     if context.psychology_state is not None:
-        sections.append(f"Psychology state:\n{context.psychology_state}")
+        sections.append(_format_structured("Psychology state", context.psychology_state))
     return "\n\n".join(sections)
 
 
@@ -78,6 +79,21 @@ def _format_text_list(title: str, items: list[str]) -> str:
     if not items:
         return f"{title}:\nNone."
     return f"{title}:\n" + "\n".join(f"- {item}" for item in items)
+
+
+def _format_structured(title: str, value: dict[str, Any]) -> str:
+    return f"{title}:\n" + json.dumps(
+        value,
+        default=_json_default,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value)
 
 
 def _query_layered_memory(
