@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from puppy.common.schemas import ShadowPortfolioState
+from puppy.common.schemas import AgentOutput, QuantFeatureTable, ShadowPortfolioState
 from puppy.quant.shadow_metrics import (
     compute_drawdown,
     compute_roi,
@@ -49,8 +49,48 @@ class ShadowPortfolio:
             sharpe=compute_sharpe(returns),
             drawdown=compute_drawdown(curve),
             win_rate=compute_win_rate(returns),
-            metadata={"action_signal": int(action_signal), "realized_return": safe_return},
+            metadata={
+                "action_signal": int(action_signal),
+                "realized_return": safe_return,
+                "shadow_return": shadow_return,
+                "previous_value": value_prev,
+                "value_next": value_next,
+                "initial_value": self.initial_value,
+            },
         )
+
+    def update_from_quant_table(
+        self,
+        quant_table: QuantFeatureTable,
+        agent_outputs: list[AgentOutput],
+        state_date: dt.date | None = None,
+    ) -> list[ShadowPortfolioState]:
+        """Update shadow states from a realized quant table.
+
+        ``QuantFeatureTable.returns`` may contain realized t+1 returns. Those
+        returns are only valid after they have occurred, when updating
+        ``ShadowPortfolioState``. Do not use ``ShadowPortfolioState_{t+1}`` to
+        make decisions at day t.
+        """
+
+        effective_date = state_date or quant_table.date
+        states: list[ShadowPortfolioState] = []
+        for output in agent_outputs:
+            signal = output.signal
+            action_signal = quant_table.action_signals.get(
+                signal.symbol, signal.action_signal
+            )
+            realized_return = quant_table.returns.get(signal.symbol)
+            states.append(
+                self.update(
+                    agent_id=signal.agent_id,
+                    symbol=signal.symbol,
+                    action_signal=action_signal,
+                    realized_return=realized_return,
+                    date=effective_date,
+                )
+            )
+        return states
 
 
 def update_shadow_portfolio(

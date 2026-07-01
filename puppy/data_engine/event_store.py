@@ -7,7 +7,13 @@ import uuid
 from collections.abc import Iterator
 from typing import Any
 
-from puppy.common.schemas import AgentOutput, TextFeature
+from puppy.common.schemas import (
+    AgentOutput,
+    GraphOutput,
+    MemoryShareRoute,
+    ShadowPortfolioState,
+    TextFeature,
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -69,6 +75,32 @@ class EventStore:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.append_event("TextFeature", date, text_feature, metadata=metadata)
+
+    def append_shadow_portfolio_state(
+        self,
+        date: dt.date | str,
+        shadow_state: ShadowPortfolioState,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event(
+            "ShadowPortfolioState", date, shadow_state, metadata=metadata
+        )
+
+    def append_graph_output(
+        self,
+        date: dt.date | str,
+        graph_output: GraphOutput,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event("GraphOutput", date, graph_output, metadata=metadata)
+
+    def append_memory_share_route(
+        self,
+        date: dt.date | str,
+        route: MemoryShareRoute,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event("MemoryShareRoute", date, route, metadata=metadata)
 
     def read_events(
         self,
