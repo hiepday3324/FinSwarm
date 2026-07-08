@@ -10,6 +10,7 @@ from typing import Any
 from puppy.common.schemas import (
     AgentOutput,
     GraphOutput,
+    MemoryShareEvent,
     MemoryShareRoute,
     ShadowPortfolioState,
     TextFeature,
@@ -101,6 +102,14 @@ class EventStore:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.append_event("MemoryShareRoute", date, route, metadata=metadata)
+
+    def append_memory_share_event(
+        self,
+        date: dt.date | str,
+        event: MemoryShareEvent,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event("MemoryShareEvent", date, event, metadata=metadata)
 
     def read_events(
         self,

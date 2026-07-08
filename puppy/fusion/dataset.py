@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from puppy.common.schemas import QuantFeatureTable, TextFeature
+from puppy.fusion.text_feature_contract import validate_text_feature_batch
 
 
 def _date_key(value: dt.date | str) -> str:
@@ -23,15 +24,8 @@ def build_text_score_dataset(
     quant_tables: list[QuantFeatureTable],
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     """Join TextFeature rows to QuantFeatureTable labels by (date, symbol)."""
-    expected_dim: int | None = None
-    for feature in text_features:
-        dim = len(feature.h_text)
-        if expected_dim is None:
-            expected_dim = dim
-        elif dim != expected_dim:
-            raise ValueError("All TextFeature.h_text vectors must have the same dimension.")
-        if feature.dim != dim:
-            raise ValueError(f"TextFeature dim mismatch for {feature.symbol} on {feature.date}.")
+    contract = validate_text_feature_batch(text_features)
+    expected_dim = int(contract["dim"])
 
     label_by_key: dict[tuple[str, str], int] = {}
     for table in quant_tables:
@@ -60,7 +54,7 @@ def build_text_score_dataset(
             }
         )
 
-    input_dim = expected_dim or 0
+    input_dim = expected_dim
     if rows:
         x = np.asarray(rows, dtype=np.float32)
     else:

@@ -1,4 +1,4 @@
-from datetime import date
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from puppy.common.enums import MemoryLayer
@@ -55,6 +55,38 @@ class MemorySharingService:
             shared_memory_ids=memory_ids,
             deduped=deduped,
         )
+
+    def apply_memory_share_routes(
+        self,
+        routes: Iterable[MemoryShareRoute],
+        source_memory_stores: Any,
+        target_agents: Mapping[str, Any] | Iterable[Any],
+        event_store: Any | None = None,
+    ) -> list[MemoryShareEvent]:
+        events: list[MemoryShareEvent] = []
+        for route in routes:
+            target_agent = _resolve_target_agent(target_agents, route)
+            if target_agent is None:
+                raise KeyError(
+                    f"No target agent for route target_agent_id={route.target_agent_id} "
+                    f"target_symbol={route.target_symbol}."
+                )
+            source_memory_store = _resolve_source_memory_store(
+                source_memory_stores=source_memory_stores,
+                route=route,
+            )
+            event = self.apply_memory_share_route(
+                route=route,
+                source_memory_store=source_memory_store,
+                target_agent=target_agent,
+            )
+            events.append(event)
+            if event_store is not None:
+                if hasattr(event_store, "append_memory_share_event"):
+                    event_store.append_memory_share_event(route.date, event)
+                else:
+                    event_store.append_event("MemoryShareEvent", route.date, event)
+        return events
 
     def _search_memory(
         self, route: MemoryShareRoute, source_memory_store: Any
@@ -139,3 +171,52 @@ def apply_memory_share_route(
         source_memory_store=source_memory_store,
         target_agent=target_agent,
     )
+
+
+def apply_memory_share_routes(
+    routes: Iterable[MemoryShareRoute],
+    source_memory_stores: Any,
+    target_agents: Mapping[str, Any] | Iterable[Any],
+    event_store: Any | None = None,
+) -> list[MemoryShareEvent]:
+    return MemorySharingService().apply_memory_share_routes(
+        routes=routes,
+        source_memory_stores=source_memory_stores,
+        target_agents=target_agents,
+        event_store=event_store,
+    )
+
+
+def _resolve_target_agent(
+    target_agents: Mapping[str, Any] | Iterable[Any],
+    route: MemoryShareRoute,
+) -> Any | None:
+    if isinstance(target_agents, Mapping):
+        for key in (route.target_agent_id, route.target_symbol):
+            if key in target_agents:
+                return target_agents[key]
+        return None
+
+    for agent in target_agents:
+        if getattr(agent, "agent_id", None) == route.target_agent_id:
+            return agent
+        if getattr(agent, "symbol", None) == route.target_symbol:
+            return agent
+    return None
+
+
+def _resolve_source_memory_store(
+    source_memory_stores: Any,
+    route: MemoryShareRoute,
+) -> Any:
+    if not isinstance(source_memory_stores, Mapping):
+        return source_memory_stores
+
+    for key in (route.source_agent_id, route.source_symbol, "default"):
+        if key in source_memory_stores:
+            return source_memory_stores[key]
+
+    layer_value = MemoryLayer(route.layer).value
+    if layer_value in source_memory_stores or "memories" in source_memory_stores:
+        return source_memory_stores
+    return source_memory_stores

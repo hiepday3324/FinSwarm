@@ -6,6 +6,7 @@ from typing import Any
 from puppy.common.schemas import (
     AgentOutput,
     GraphOutput,
+    MemoryShareEvent,
     MemoryShareRoute,
     PortfolioSnapshot,
     QuantFeatureTable,
@@ -112,6 +113,30 @@ class ResultStore:
         if target_symbol is not None:
             routes = [route for route in routes if route.target_symbol == target_symbol]
         return routes
+
+    def read_memory_share_events(
+        self,
+        date: dt.date | str | None = None,
+        source_agent_id: str | None = None,
+        target_agent_id: str | None = None,
+    ) -> list[MemoryShareEvent]:
+        events = [
+            MemoryShareEvent(**payload)
+            for payload in self.read_artifacts("MemoryShareEvent", date=date)
+        ]
+        if source_agent_id is not None:
+            events = [
+                event
+                for event in events
+                if event.route.source_agent_id == source_agent_id
+            ]
+        if target_agent_id is not None:
+            events = [
+                event
+                for event in events
+                if event.route.target_agent_id == target_agent_id
+            ]
+        return events
 
     def to_dataframe(self, artifact_type: str, date: dt.date | str | None = None):
         try:
