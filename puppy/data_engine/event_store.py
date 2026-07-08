@@ -9,9 +9,13 @@ from typing import Any
 
 from puppy.common.schemas import (
     AgentOutput,
+    AllocationDecision,
+    AllocationWeights,
+    FusionOutput,
     GraphOutput,
     MemoryShareEvent,
     MemoryShareRoute,
+    PortfolioSnapshot,
     ShadowPortfolioState,
     TextFeature,
 )
@@ -110,6 +114,44 @@ class EventStore:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.append_event("MemoryShareEvent", date, event, metadata=metadata)
+
+    def append_fusion_output(
+        self,
+        date: dt.date | str,
+        fusion_output: FusionOutput,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event("FusionOutput", date, fusion_output, metadata=metadata)
+
+    def append_allocation_weights(
+        self,
+        date: dt.date | str,
+        allocation_weights: AllocationWeights,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event(
+            "AllocationWeights", date, allocation_weights, metadata=metadata
+        )
+
+    def append_allocation_decision(
+        self,
+        date: dt.date | str,
+        allocation_decision: AllocationDecision,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event(
+            "AllocationDecision", date, allocation_decision, metadata=metadata
+        )
+
+    def append_portfolio_snapshot(
+        self,
+        date: dt.date | str,
+        portfolio_snapshot: PortfolioSnapshot,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event(
+            "PortfolioSnapshot", date, portfolio_snapshot, metadata=metadata
+        )
 
     def read_events(
         self,

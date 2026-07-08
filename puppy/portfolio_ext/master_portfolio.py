@@ -76,3 +76,17 @@ class MasterPortfolio:
                 "transaction_cost": cost,
             },
         )
+
+    def apply_allocation_weights(
+        self,
+        allocation: AllocationWeights,
+        prices: dict[str, Any],
+        date: dt.date,
+        transaction_cost: float = 0.0,
+    ) -> PortfolioSnapshot:
+        return self.apply_target_weights(
+            date=date,
+            prices=prices,
+            target_weights=allocation,
+            transaction_cost=transaction_cost,
+        )

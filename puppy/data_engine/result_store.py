@@ -5,6 +5,9 @@ from typing import Any
 
 from puppy.common.schemas import (
     AgentOutput,
+    AllocationDecision,
+    AllocationWeights,
+    FusionOutput,
     GraphOutput,
     MemoryShareEvent,
     MemoryShareRoute,
@@ -137,6 +140,33 @@ class ResultStore:
                 if event.route.target_agent_id == target_agent_id
             ]
         return events
+
+    def read_fusion_outputs(
+        self,
+        date: dt.date | str | None = None,
+    ) -> list[FusionOutput]:
+        return [
+            FusionOutput(**payload)
+            for payload in self.read_artifacts("FusionOutput", date=date)
+        ]
+
+    def read_allocation_weights(
+        self,
+        date: dt.date | str | None = None,
+    ) -> list[AllocationWeights]:
+        return [
+            AllocationWeights(**payload)
+            for payload in self.read_artifacts("AllocationWeights", date=date)
+        ]
+
+    def read_allocation_decisions(
+        self,
+        date: dt.date | str | None = None,
+    ) -> list[AllocationDecision]:
+        return [
+            AllocationDecision(**payload)
+            for payload in self.read_artifacts("AllocationDecision", date=date)
+        ]
 
     def to_dataframe(self, artifact_type: str, date: dt.date | str | None = None):
         try:

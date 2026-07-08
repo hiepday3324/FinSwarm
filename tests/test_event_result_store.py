@@ -6,6 +6,9 @@ import unittest
 from puppy.common.schemas import (
     AgentOutput,
     AgentSignal,
+    AllocationDecision,
+    AllocationWeights,
+    FusionOutput,
     GraphOutput,
     MemoryShareRoute,
     PortfolioSnapshot,
@@ -191,6 +194,59 @@ class EventResultStoreTest(unittest.TestCase):
             self.assertEqual(
                 result_store.read_memory_share_routes(target_symbol="NVDA")[0].reason,
                 "graph attention",
+            )
+
+    def test_fusion_allocation_and_portfolio_typed_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "events.jsonl")
+            event_store = EventStore(path)
+            date = dt.date(2026, 1, 4)
+            fusion_output = FusionOutput(
+                date=date,
+                symbols=["TSLA"],
+                text_scores={"TSLA": 0.8},
+                graph_scores={"TSLA": 0.4},
+                fusion_scores={"TSLA": 0.75},
+                gates={"TSLA": 0.5},
+                conflict_flags={"TSLA": False},
+            )
+            allocation_weights = AllocationWeights(
+                date=date,
+                weights={"TSLA": 0.35},
+                cash_weight=0.65,
+            )
+            allocation_decision = AllocationDecision(
+                date=date,
+                action="increase_exposure",
+                score=1,
+                reason="fusion allocation",
+            )
+            snapshot = PortfolioSnapshot(
+                date=date,
+                cash=65000.0,
+                positions={"TSLA": 140.0},
+                weights={"TSLA": 0.35},
+                equity=100000.0,
+            )
+
+            event_store.append_fusion_output(date, fusion_output)
+            event_store.append_allocation_weights(date, allocation_weights)
+            event_store.append_allocation_decision(date, allocation_decision)
+            event_store.append_portfolio_snapshot(date, snapshot)
+
+            result_store = ResultStore(event_store)
+            self.assertEqual(result_store.read_fusion_outputs(date)[0].symbols, ["TSLA"])
+            self.assertEqual(
+                result_store.read_allocation_weights(date)[0].weights["TSLA"],
+                0.35,
+            )
+            self.assertEqual(
+                result_store.read_allocation_decisions(date)[0].action,
+                "increase_exposure",
+            )
+            self.assertEqual(
+                result_store.read_portfolio_snapshots(date)[0].equity,
+                100000.0,
             )
 
 
