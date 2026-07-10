@@ -79,8 +79,9 @@ class SectorAgent:
     ) -> str:
         request_date = request.date if isinstance(request, DebateRequest) else request["date"]
         signal = self.get_signal(request_date)
+        cited_refs = signal.memory_refs + signal.shared_context_used
         cited_ids = ", ".join(
-            f"{ref.layer}:{ref.memory_id}" for ref in signal.memory_refs
+            f"{ref.layer}:{ref.memory_id}" for ref in cited_refs
         )
         if not cited_ids:
             cited_ids = "no cited memory"

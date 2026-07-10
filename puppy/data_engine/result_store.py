@@ -7,6 +7,9 @@ from puppy.common.schemas import (
     AgentOutput,
     AllocationDecision,
     AllocationWeights,
+    DebateRequest,
+    DebateTranscript,
+    DebateVerdict,
     FusionOutput,
     GraphOutput,
     MemoryShareEvent,
@@ -167,6 +170,63 @@ class ResultStore:
             AllocationDecision(**payload)
             for payload in self.read_artifacts("AllocationDecision", date=date)
         ]
+
+    def read_debate_requests(
+        self,
+        date: dt.date | str | None = None,
+        agent_id: str | None = None,
+        symbol: str | None = None,
+    ) -> list[DebateRequest]:
+        requests = [
+            DebateRequest(**payload)
+            for payload in self.read_artifacts("DebateRequest", date=date)
+        ]
+        if agent_id is not None:
+            requests = [request for request in requests if request.agent_id == agent_id]
+        if symbol is not None:
+            requests = [request for request in requests if request.symbol == symbol]
+        return requests
+
+    def read_debate_transcripts(
+        self,
+        date: dt.date | str | None = None,
+        agent_id: str | None = None,
+        symbol: str | None = None,
+    ) -> list[DebateTranscript]:
+        transcripts = [
+            DebateTranscript(**payload)
+            for payload in self.read_artifacts("DebateTranscript", date=date)
+        ]
+        if agent_id is not None:
+            transcripts = [
+                transcript
+                for transcript in transcripts
+                if transcript.agent_id == agent_id
+            ]
+        if symbol is not None:
+            transcripts = [
+                transcript for transcript in transcripts if transcript.symbol == symbol
+            ]
+        return transcripts
+
+    def read_debate_verdicts(
+        self,
+        date: dt.date | str | None = None,
+        agent_id: str | None = None,
+        symbol: str | None = None,
+        verdict: str | None = None,
+    ) -> list[DebateVerdict]:
+        verdicts = [
+            DebateVerdict(**payload)
+            for payload in self.read_artifacts("DebateVerdict", date=date)
+        ]
+        if agent_id is not None:
+            verdicts = [item for item in verdicts if item.agent_id == agent_id]
+        if symbol is not None:
+            verdicts = [item for item in verdicts if item.symbol == symbol]
+        if verdict is not None:
+            verdicts = [item for item in verdicts if item.verdict == verdict]
+        return verdicts
 
     def to_dataframe(self, artifact_type: str, date: dt.date | str | None = None):
         try:

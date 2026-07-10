@@ -11,6 +11,9 @@ from puppy.common.schemas import (
     AgentOutput,
     AllocationDecision,
     AllocationWeights,
+    DebateRequest,
+    DebateTranscript,
+    DebateVerdict,
     FusionOutput,
     GraphOutput,
     MemoryShareEvent,
@@ -141,6 +144,36 @@ class EventStore:
     ) -> dict[str, Any]:
         return self.append_event(
             "AllocationDecision", date, allocation_decision, metadata=metadata
+        )
+
+    def append_debate_request(
+        self,
+        date: dt.date | str,
+        debate_request: DebateRequest,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event(
+            "DebateRequest", date, debate_request, metadata=metadata
+        )
+
+    def append_debate_transcript(
+        self,
+        date: dt.date | str,
+        debate_transcript: DebateTranscript,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event(
+            "DebateTranscript", date, debate_transcript, metadata=metadata
+        )
+
+    def append_debate_verdict(
+        self,
+        date: dt.date | str,
+        debate_verdict: DebateVerdict,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.append_event(
+            "DebateVerdict", date, debate_verdict, metadata=metadata
         )
 
     def append_portfolio_snapshot(

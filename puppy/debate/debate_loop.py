@@ -13,11 +13,12 @@ class DebateLoop:
     ) -> DebateTranscript:
         question = self._build_question(request)
         answer = self._build_answer(request=request, question=question, sector_agent=sector_agent)
-        cited_refs = (
-            request.agent_signal.memory_refs
-            if request.agent_signal is not None
-            else []
-        )
+        cited_refs = []
+        if request.agent_signal is not None:
+            cited_refs = (
+                request.agent_signal.memory_refs
+                + request.agent_signal.shared_context_used
+            )
         return DebateTranscript(
             date=request.date,
             agent_id=request.agent_id,
@@ -53,6 +54,7 @@ class DebateLoop:
 
         cited_refs: list[MemoryRef] = (
             request.agent_signal.memory_refs
+            + request.agent_signal.shared_context_used
             if request.agent_signal is not None
             else []
         )
