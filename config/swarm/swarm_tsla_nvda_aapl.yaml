@@ -1,7 +1,7 @@
 run:
   run_id: swarm_tsla_nvda_aapl
-  start_date: "2022-08-16"
-  end_date: "2022-10-04"
+  start_date: "2024-07-11"
+  end_date: "2026-07-10"
 
 assets:
   symbols:
@@ -13,3 +13,4 @@ paths:
   data_config: config/swarm/data_config.yaml
   model_config: config/swarm/model_config.yaml
   experiment_config: config/swarm/experiment_config.yaml
+  price_split_manifest: data/manifests/price_split_manifest.json

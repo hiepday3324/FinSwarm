@@ -1,0 +1,86 @@
+{
+  "provider": "sec_edgar",
+  "downloaded_at": "2026-07-11T20:33:27.799340+00:00",
+  "requested_start": "2024-07-11",
+  "requested_end": "2026-07-10",
+  "forms": [
+    "10-K",
+    "10-K/A",
+    "10-Q",
+    "10-Q/A",
+    "8-K",
+    "8-K/A"
+  ],
+  "summaries": [
+    {
+      "symbol": "TSLA",
+      "cik": "0001318605",
+      "requested_start": "2024-07-11",
+      "requested_end": "2026-07-10",
+      "selected_filing_count": 32,
+      "completed_filing_count": 32,
+      "failed_filing_count": 0,
+      "form_counts": {
+        "8-K": 22,
+        "10-Q": 6,
+        "10-K": 2,
+        "10-K/A": 2
+      },
+      "downloaded_file_count": 1371,
+      "skipped_existing_file_count": 0,
+      "failed_file_count": 0,
+      "first_acceptance_datetime": "2024-07-23T20:32:27.000Z",
+      "last_acceptance_datetime": "2026-07-02T13:01:26.000Z",
+      "metadata_path": "data/raw/filings/sec/TSLA/2024-07-11_2026-07-10_metadata.jsonl",
+      "failed_filings": []
+    },
+    {
+      "symbol": "NVDA",
+      "cik": "0001045810",
+      "requested_start": "2024-07-11",
+      "requested_end": "2026-07-10",
+      "selected_filing_count": 29,
+      "completed_filing_count": 29,
+      "failed_filing_count": 0,
+      "form_counts": {
+        "8-K": 21,
+        "10-Q": 6,
+        "10-K": 2
+      },
+      "downloaded_file_count": 1120,
+      "skipped_existing_file_count": 0,
+      "failed_file_count": 0,
+      "first_acceptance_datetime": "2024-08-28T20:21:16.000Z",
+      "last_acceptance_datetime": "2026-07-02T13:23:16.000Z",
+      "metadata_path": "data/raw/filings/sec/NVDA/2024-07-11_2026-07-10_metadata.jsonl",
+      "failed_filings": []
+    },
+    {
+      "symbol": "AAPL",
+      "cik": "0000320193",
+      "requested_start": "2024-07-11",
+      "requested_end": "2026-07-10",
+      "selected_filing_count": 28,
+      "completed_filing_count": 28,
+      "failed_filing_count": 0,
+      "form_counts": {
+        "8-K": 20,
+        "10-Q": 6,
+        "10-K": 2
+      },
+      "downloaded_file_count": 929,
+      "skipped_existing_file_count": 0,
+      "failed_file_count": 0,
+      "first_acceptance_datetime": "2024-08-01T20:30:26.000Z",
+      "last_acceptance_datetime": "2026-05-01T10:01:00.000Z",
+      "metadata_path": "data/raw/filings/sec/AAPL/2024-07-11_2026-07-10_metadata.jsonl",
+      "failed_filings": []
+    }
+  ],
+  "total_selected_filings": 89,
+  "total_completed_filings": 89,
+  "total_failed_filings": 0,
+  "total_downloaded_files": 3420,
+  "total_skipped_existing_files": 0,
+  "total_failed_files": 0
+}

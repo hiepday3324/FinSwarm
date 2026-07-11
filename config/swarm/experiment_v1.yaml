@@ -1,0 +1,76 @@
+run:
+  run_id: finswarm_v1
+  seed: 42
+
+assets:
+  symbols:
+    - TSLA
+    - NVDA
+    - AAPL
+
+time:
+  timezone: America/New_York
+  decision_cutoff: "16:10:00"
+  execution: next_open
+  valuation: next_close
+
+data:
+  start: "2024-07-11"
+  end: "2026-07-10"
+
+  split_manifest: data/manifests/price_split_manifest.json
+
+  raw:
+    prices: data/raw/prices/massive
+    news: data/raw/news/massive
+    filings: data/raw/filings/sec
+
+  canonical:
+    prices: data/parquet/prices.parquet
+    news: data/parquet/news.parquet
+    filings: data/parquet/filings.parquet
+
+  duckdb: data/duckdb/finswarm.db
+
+providers:
+  prices: massive
+  news: massive
+  filings: sec_edgar
+
+normalization:
+  prices:
+    adjustment: split_adjusted
+    adj_close_policy: null
+    forward_fill: false
+
+  news:
+    available_at_field: published_utc
+    row_granularity: article_symbol
+    text_field: description
+    preserve_insights: true
+
+  filings:
+    available_at_field: acceptance_datetime
+    include_primary_document: true
+    include_8k_exhibits:
+      - EX-99
+      - EX-99.1
+      - EX-99.2
+
+market_step:
+  event_window: previous_cutoff_open_current_cutoff_closed
+  require_exact_price_date: true
+  stale_price_policy: report_only
+  include_weekend_events_in_next_trading_step: true
+
+label:
+  horizon: next_open_to_close
+  formula: close_next_over_open_next_minus_one
+  threshold_bps: 10
+  neutral_policy: mask
+
+portfolio:
+  initial_cash: 1000000
+  max_weight_per_asset: 0.35
+  transaction_cost_bps: 5
+  long_only: true

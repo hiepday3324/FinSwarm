@@ -1,0 +1,51 @@
+{
+  "provider": "massive",
+  "adjusted": true,
+  "downloaded_at": "2026-07-11T18:46:16.935878+00:00",
+  "symbols": [
+    "TSLA",
+    "NVDA",
+    "AAPL"
+  ],
+  "summaries": [
+    {
+      "symbol": "TSLA",
+      "requested_start": "2024-07-01",
+      "requested_end": "2026-07-10",
+      "record_count": 501,
+      "first_market_date": "2024-07-11",
+      "last_market_date": "2026-07-10",
+      "validation_error_count": 0,
+      "validation_errors": [],
+      "sha256": "a81821a2ed4cdde837a71c34e084d522e31ddcf94722ece097e3f08e18ba86c7",
+      "output_path": "data/raw/prices/massive/TSLA/2024-07-01_2026-07-10.jsonl"
+    },
+    {
+      "symbol": "NVDA",
+      "requested_start": "2024-07-01",
+      "requested_end": "2026-07-10",
+      "record_count": 501,
+      "first_market_date": "2024-07-11",
+      "last_market_date": "2026-07-10",
+      "validation_error_count": 0,
+      "validation_errors": [],
+      "sha256": "5ccd81d5369234533b88cf3902150b0b50bc5ec784c29338b37cad1ec0f3209d",
+      "output_path": "data/raw/prices/massive/NVDA/2024-07-01_2026-07-10.jsonl"
+    },
+    {
+      "symbol": "AAPL",
+      "requested_start": "2024-07-01",
+      "requested_end": "2026-07-10",
+      "record_count": 501,
+      "first_market_date": "2024-07-11",
+      "last_market_date": "2026-07-10",
+      "validation_error_count": 0,
+      "validation_errors": [],
+      "sha256": "1a32b04f5d8ff1c11015014ba2010ad9af1e0b0adedcb49e91575cd28cf400ea",
+      "output_path": "data/raw/prices/massive/AAPL/2024-07-01_2026-07-10.jsonl"
+    }
+  ],
+  "common_trading_day_count": 501,
+  "common_first_date": "2024-07-11",
+  "common_last_date": "2026-07-10"
+}

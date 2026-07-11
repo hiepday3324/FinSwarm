@@ -1,0 +1,142 @@
+{
+  "provider": "massive",
+  "requested_start": "2024-07-11",
+  "requested_end": "2026-07-10",
+  "symbols": [
+    "TSLA",
+    "NVDA",
+    "AAPL"
+  ],
+  "summaries": [
+    {
+      "symbol": "TSLA",
+      "requested_start": "2024-07-11",
+      "requested_end": "2026-07-10",
+      "record_count": 3988,
+      "page_count": 4,
+      "duplicate_count": 0,
+      "first_published_utc": "2024-07-11T01:31:58Z",
+      "last_published_utc": "2026-07-10T19:15:00Z",
+      "empty_title_count": 0,
+      "empty_description_count": 0,
+      "empty_published_utc_count": 0,
+      "publisher_count": 7,
+      "top_publishers": [
+        [
+          "The Motley Fool",
+          1816
+        ],
+        [
+          "Benzinga",
+          838
+        ],
+        [
+          "Investing.com",
+          801
+        ],
+        [
+          "GlobeNewswire Inc.",
+          375
+        ],
+        [
+          "MarketWatch",
+          107
+        ],
+        [
+          "Zacks Investment Research",
+          32
+        ],
+        [
+          "Invezz",
+          19
+        ]
+      ],
+      "output_path": "data/raw/news/massive/TSLA/2024-07-11_2026-07-10.jsonl"
+    },
+    {
+      "symbol": "NVDA",
+      "requested_start": "2024-07-11",
+      "requested_end": "2026-07-10",
+      "record_count": 9065,
+      "page_count": 10,
+      "duplicate_count": 0,
+      "first_published_utc": "2024-07-11T00:51:02Z",
+      "last_published_utc": "2026-07-10T19:27:00Z",
+      "empty_title_count": 0,
+      "empty_description_count": 0,
+      "empty_published_utc_count": 0,
+      "publisher_count": 6,
+      "top_publishers": [
+        [
+          "The Motley Fool",
+          6366
+        ],
+        [
+          "Investing.com",
+          1165
+        ],
+        [
+          "Benzinga",
+          943
+        ],
+        [
+          "GlobeNewswire Inc.",
+          546
+        ],
+        [
+          "Zacks Investment Research",
+          38
+        ],
+        [
+          "MarketWatch",
+          7
+        ]
+      ],
+      "output_path": "data/raw/news/massive/NVDA/2024-07-11_2026-07-10.jsonl"
+    },
+    {
+      "symbol": "AAPL",
+      "requested_start": "2024-07-11",
+      "requested_end": "2026-07-10",
+      "record_count": 3858,
+      "page_count": 4,
+      "duplicate_count": 0,
+      "first_published_utc": "2024-07-11T00:51:02Z",
+      "last_published_utc": "2026-07-10T09:43:00Z",
+      "empty_title_count": 0,
+      "empty_description_count": 0,
+      "empty_published_utc_count": 0,
+      "publisher_count": 6,
+      "top_publishers": [
+        [
+          "The Motley Fool",
+          2415
+        ],
+        [
+          "Investing.com",
+          610
+        ],
+        [
+          "Benzinga",
+          477
+        ],
+        [
+          "GlobeNewswire Inc.",
+          331
+        ],
+        [
+          "Zacks Investment Research",
+          23
+        ],
+        [
+          "MarketWatch",
+          2
+        ]
+      ],
+      "output_path": "data/raw/news/massive/AAPL/2024-07-11_2026-07-10.jsonl"
+    }
+  ],
+  "total_symbol_article_records": 16911,
+  "total_duplicate_count": 0,
+  "total_page_count": 18
+}

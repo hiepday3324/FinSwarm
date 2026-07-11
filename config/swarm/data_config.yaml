@@ -8,3 +8,60 @@ paths:
   checkpoints: data/checkpoints
   model_artifacts: data/model_artifacts
   reports: data/reports
+
+price_data:
+  provider: massive
+  api_key_env: MASSIVE_API_KEY
+
+  symbols:
+    - TSLA
+    - NVDA
+    - AAPL
+
+  requested_start: "2024-07-01"
+  requested_end: "2026-07-10"
+
+  multiplier: 1
+  timespan: day
+  adjusted: true
+  sort: asc
+  limit: 50000
+
+  market_timezone: America/New_York
+  forward_fill: false
+news_data:
+  provider: massive
+  api_key: "NNGqgeDeneN8MkzSnwSTBOjdmo6so86o"
+
+  symbols:
+    - TSLA
+    - NVDA
+    - AAPL
+
+  requested_start: "2024-07-11"
+  requested_end: "2026-07-10"
+
+  sort: published_utc
+  order: asc
+  limit: 1000
+
+filing_data:
+  provider: sec_edgar
+
+  requested_start: "2024-07-11"
+  requested_end: "2026-07-10"
+
+  user_agent: "FinSwarm Research hiepldhe186750@fpt.edu.vn"
+
+  forms:
+    - 10-K
+    - 10-K/A
+    - 10-Q
+    - 10-Q/A
+    - 8-K
+    - 8-K/A
+
+  companies:
+    TSLA: "0001318605"
+    NVDA: "0001045810"
+    AAPL: "0000320193"

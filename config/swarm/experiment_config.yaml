@@ -3,3 +3,23 @@ experiment:
   initial_cash: 1000000
   max_weight_per_asset: 0.35
   transaction_cost_bps: 5
+
+  split_manifest: data/manifests/price_split_manifest.json
+
+  split_names:
+    warmup: warmup
+    train: train
+    validation: validation
+    test: test
+
+  shuffle: false
+
+  decision_protocol:
+    decision_time: after_close
+    execution_time: next_open
+    valuation_time: next_close
+    market_timezone: America/New_York
+
+  target:
+    type: next_open_to_close_return
+    neutral_threshold_bps: 10
