@@ -169,4 +169,5 @@ tgi_scripts/data/
 /data/training
 /data/duckdb
 /data/parquet
+/data/model_artifacts
 *.parquet
