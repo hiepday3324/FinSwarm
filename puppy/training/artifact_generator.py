@@ -46,7 +46,7 @@ from .temporal_assertions import (
 
 
 PROMPT_VERSION = "bootstrap-decision-v1"
-GENERATOR_VERSION = "stage5-causal-artifacts-v1"
+GENERATOR_VERSION = "stage5-canonical-causal-artifacts-v2"
 
 
 def _git_commit(root: Path) -> str:
@@ -120,6 +120,7 @@ def _output_row(bundle: Any, run_id: str, split: str) -> dict[str, Any]:
         "context_hash": output.context_hash,
         "prompt_version": output.prompt_version,
         "adapter_version": output.adapter_version,
+        "text_score": bundle.text_score,
         "split": split,
         "metadata": output.metadata,
     }
@@ -171,9 +172,21 @@ def generate_training_artifacts(
     overwrite: bool = False,
     output_root: str | Path | None = None,
     force_llm: bool = False,
+    causal_agents: dict[str, SectorAgent] | None = None,
+    encoder: Any | None = None,
+    text_score_head: Any | None = None,
+    prompt_version: str | None = None,
 ) -> dict[str, Any]:
-    if not bootstrap:
-        raise ValueError("CLI non-bootstrap generation requires an injected causal LLM adapter; use --bootstrap offline")
+    if not bootstrap and causal_agents is None:
+        raise RuntimeError(
+            "Real causal artifact generation requires injected SectorAgent instances "
+            "whose llm_agent implements causal_decide; no external API was called."
+        )
+    if not bootstrap and encoder is None:
+        raise RuntimeError(
+            "Real causal artifact generation requires an injected canonical "
+            "TextStreamEncoder; no fallback encoder was selected."
+        )
     config = load_stage4_config(config_path)
     splits, common_dates = _split_manifest(config.split_manifest)
     requested_start = dt.date.fromisoformat(start) if start else common_dates[0]
@@ -185,12 +198,20 @@ def generate_training_artifacts(
     root = Path(output_root) if output_root else config.repo_root / "data/training"
     output_dir = root / run_id
     feature_schema = {
-        "version": "causal-feature-schema-v1",
+        "version": "canonical-causal-feature-schema-v2",
         "observed_feature_names": OBSERVED_FEATURE_NAMES,
         "observed_definitions": FEATURE_DEFINITIONS,
         "graph_feature_names": FEATURE_NAMES,
         "forbidden_graph_fields": sorted(FORBIDDEN_GRAPH_FIELDS),
         "graph_targets_separate": True,
+        "psychology_encoding": {
+            "feature_names": [
+                "psychology_greed", "psychology_fear", "psychology_neutral"
+            ],
+            "greed": [1, 0, 0],
+            "fear": [0, 1, 0],
+            "neutral": [0, 0, 1],
+        },
     }
     feature_schema_hash = stable_id(feature_schema)
     input_hashes = {
@@ -202,8 +223,12 @@ def generate_training_artifacts(
         "config_hash": sha256_path(config.config_path),
         "input_hashes": input_hashes,
         "feature_schema_hash": feature_schema_hash,
-        "prompt_version": PROMPT_VERSION,
-        "encoder_version": BOOTSTRAP_ENCODER_VERSION,
+        "prompt_version": prompt_version or PROMPT_VERSION,
+        "encoder_version": (
+            BOOTSTRAP_ENCODER_VERSION
+            if bootstrap
+            else f"transformers-frozen:{getattr(encoder, 'revision', 'configured')}"
+        ),
         "adapter_version": ADAPTER_VERSION,
         "bootstrap": bootstrap,
         "start": requested_start,
@@ -252,8 +277,13 @@ def generate_training_artifacts(
         "config_path": config.relative(config.config_path),
         "split_manifest": config.relative(config.split_manifest),
         "git_commit": _git_commit(config.repo_root),
-        "bootstrap_policy": "sha256-context-bucket-v1",
-        "external_llm_used": False,
+        "bootstrap_policy": "sha256-context-bucket-v1" if bootstrap else None,
+        "external_llm_used": not bootstrap,
+        "action_source": (
+            "bootstrap_sha256_context_bucket"
+            if bootstrap
+            else "real_causal_sector_agent"
+        ),
     }
     atomic_write_json(output_dir / "data_manifest.json", data_manifest)
     atomic_write_json(output_dir / "feature_schema.json", feature_schema)
@@ -269,11 +299,30 @@ def generate_training_artifacts(
     for row in price_rows:
         price_history[row["symbol"]].append(PriceBar(**row))
     agents: dict[str, SectorAgent] = {}
-    for symbol in config.symbols:
-        agent_id = f"sector_{symbol.lower()}"
-        adapter = LegacyFinMemAdapter(SimpleNamespace(), agent_id, symbol, bootstrap=True)
-        agents[symbol] = SectorAgent(agent_id, symbol, SimpleNamespace(), causal_adapter=adapter)
-    orchestrator = CausalOrchestrator(DeterministicTextEncoder())
+    if causal_agents is not None:
+        missing_agents = set(config.symbols) - set(causal_agents)
+        if missing_agents:
+            raise ValueError(f"Missing causal SectorAgent(s): {sorted(missing_agents)}")
+        agents = {symbol: causal_agents[symbol] for symbol in config.symbols}
+        bootstrap_adapters = [
+            symbol
+            for symbol, agent in agents.items()
+            if bool(getattr(agent.causal_adapter, "bootstrap", False))
+        ]
+        if bootstrap_adapters:
+            raise ValueError(
+                "Real causal artifact generation received bootstrap adapter(s): "
+                f"{bootstrap_adapters}"
+            )
+    else:
+        for symbol in config.symbols:
+            agent_id = f"sector_{symbol.lower()}"
+            adapter = LegacyFinMemAdapter(SimpleNamespace(), agent_id, symbol, bootstrap=True)
+            agents[symbol] = SectorAgent(agent_id, symbol, SimpleNamespace(), causal_adapter=adapter)
+    orchestrator = CausalOrchestrator(
+        encoder or DeterministicTextEncoder(),
+        text_score_head=text_score_head,
+    )
     shadow = ShadowPortfolio(initial_value=1.0)
     latest_reasons: dict[str, tuple[dt.date, str]] = {}
     pending_by_id: dict[str, PendingDecision] = {}
@@ -296,9 +345,9 @@ def generate_training_artifacts(
             config_path=config.relative(config.config_path),
             current_date=date,
             current_cutoff=step.as_of,
-            bootstrap=True,
-            prompt_version=PROMPT_VERSION,
-            encoder_version=BOOTSTRAP_ENCODER_VERSION,
+            bootstrap=bootstrap,
+            prompt_version=str(fingerprint_payload["prompt_version"]),
+            encoder_version=str(fingerprint_payload["encoder_version"]),
             adapter_version=ADAPTER_VERSION,
             git_commit=data_manifest["git_commit"],
             memory_sharing_enabled=False,
@@ -363,9 +412,11 @@ def generate_training_artifacts(
         text_by_symbol = {}
         action_signals = {}
         shadow_states = {}
+        psychology_states = {}
+        text_scores = {}
         for symbol, agent in agents.items():
             prior_state = shadow.get_state(agent.agent_id, symbol)
-            psychology = build_psychology_state(prior_state) if prior_state else None
+            psychology = build_psychology_state(prior_state)
             prior_reason = latest_reasons.get(agent.agent_id)
             latest_reason = prior_reason[1] if prior_reason and prior_reason[0] < date else None
             bundle = orchestrator.decide(
@@ -382,6 +433,8 @@ def generate_training_artifacts(
             text_by_symbol[symbol] = bundle.text_feature
             action_signals[symbol] = bundle.output.signal.action_signal
             shadow_states[symbol] = prior_state
+            psychology_states[symbol] = psychology
+            text_scores[symbol] = bundle.text_score
             latest_reasons[agent.agent_id] = (date, bundle.output.signal.reason)
 
         for symbol in config.symbols:
@@ -390,8 +443,14 @@ def generate_training_artifacts(
                 return_history[symbol].append(float(observed_return))
                 return_source_dates[symbol].append(date)
         graph = build_causal_graph_sample(
-            observed, action_signals, shadow_states, text_by_symbol,
-            return_history, return_source_dates,
+            observed,
+            action_signals,
+            shadow_states,
+            text_by_symbol,
+            return_history,
+            return_source_dates,
+            text_scores=text_scores,
+            psychology_states=psychology_states,
         )
         assert_graph_contract(FEATURE_NAMES, graph["feature_matrix"])
         context_hashes = [bundles[symbol].context.context_hash for symbol in config.symbols]
@@ -533,7 +592,8 @@ def generate_training_artifacts(
         "run_id": run_id,
         "start": requested_start.isoformat(),
         "end": requested_end.isoformat(),
-        "bootstrap": True,
+        "bootstrap": bootstrap,
+        "action_source": data_manifest["action_source"],
         "artifact_counts": counts,
         "manifest_fingerprint": fingerprint,
         "temporal_gate": temporal["status"],

@@ -13,6 +13,7 @@ from puppy.common.schemas import (
     ShadowPortfolioState,
     TextFeature,
 )
+from puppy.graph.graph_dataset import CANONICAL_FEATURE_NAMES
 
 
 FORBIDDEN_GRAPH_FIELDS = {"return", "label", "asset_return", "strategy_return", "direction_label", "outcome_id"}
@@ -41,6 +42,11 @@ def assert_context_causal(context: AgentContext, cutoff: dt.datetime) -> None:
             raise AssertionError("AgentContext contains future memory")
         if ref.layer == "reflection" and ref.date is not None and ref.date >= context.date:
             raise AssertionError("Decision sees same-day or future reflection source")
+    if any(
+        item.created_at is not None and item.created_at >= context.date
+        for item in context.shared_context
+    ):
+        raise AssertionError("Decision sees same-day or future shared memory")
 
 
 def assert_shadow_prior(state: ShadowPortfolioState | None, decision_date: dt.date) -> None:
@@ -70,6 +76,10 @@ def assert_graph_contract(feature_names: list[str], feature_matrix: Any) -> None
         raise AssertionError(f"Forbidden graph feature(s): {sorted(forbidden)}")
     if getattr(feature_matrix, "shape", (0, 0))[-1] != len(feature_names):
         raise AssertionError("Graph feature matrix width does not match feature names")
+    if tuple(feature_names) != CANONICAL_FEATURE_NAMES:
+        raise AssertionError(
+            "Graph H0 must use the canonical market/action/text/shadow/psychology order"
+        )
 
 
 def assert_unique_ids(values: Iterable[str], artifact_name: str) -> None:

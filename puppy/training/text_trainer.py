@@ -10,7 +10,10 @@ import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
 
-from puppy.fusion.trainable_text_head import TrainableTextHead
+from puppy.fusion.text_score_head import TextScoreHead
+
+
+CanonicalTextScoreHead = TextScoreHead
 
 from .checkpoint import (
     TrainOnlyScaler,
@@ -93,7 +96,7 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
 
 
 def predict_mlp(
-    model: TrainableTextHead,
+    model: TextScoreHead,
     features: np.ndarray,
     *,
     device: str = "cpu",
@@ -121,12 +124,13 @@ def fit_mlp(
     seed: int,
     device: str = "cpu",
     fixed_epochs: int | None = None,
-) -> tuple[TrainableTextHead, dict[str, Any]]:
+) -> tuple[TextScoreHead, dict[str, Any]]:
     seed_everything(seed)
-    model = TrainableTextHead(
+    model = TextScoreHead(
         input_dim=train_features.shape[1],
         hidden_dim=int(model_config["hidden_dim"]),
         dropout=float(model_config["dropout"]),
+        seed=seed,
     ).to(device)
     initial_hash = state_dict_sha256(model.state_dict())
     optimizer = torch.optim.AdamW(
@@ -266,17 +270,13 @@ def train_text_stream(
     mlp_selection = binary_metrics(
         selection.targets, mlp_selection_probability, symbols=selection.symbols
     )
-    selected_model = (
-        "mlp"
-        if mlp_selection["log_loss"] < logistic_selection["log_loss"]
-        else "logistic_regression"
-    )
+    selected_model = "canonical_text_score_head"
     checkpoint = {
-        "model_type": "mlp",
+        "model_type": "canonical_text_score_head",
         "architecture": mlp.architecture_config(),
         "state_dict": mlp.state_dict(),
         "seed": seed,
-        "selected": selected_model == "mlp",
+        "selected": True,
         "best_epoch": mlp_history["best_epoch"],
         "validation_prediction_probe": {
             "logit": float(mlp_selection_logits[0]),
@@ -321,9 +321,9 @@ def train_text_stream(
     return history
 
 
-def load_text_mlp(path: str | Path, *, device: str = "cpu") -> TrainableTextHead:
+def load_text_mlp(path: str | Path, *, device: str = "cpu") -> TextScoreHead:
     checkpoint = torch.load(Path(path), map_location=device, weights_only=False)
-    model = TrainableTextHead.from_config(checkpoint["architecture"]).to(device)
+    model = TextScoreHead.from_config(checkpoint["architecture"]).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return model
@@ -338,14 +338,16 @@ def selected_text_predictions(
     directory = Path(model_dir)
     history = json.loads((directory / "text_training_history.json").read_text(encoding="utf-8"))
     selected = history["selected_text_model"]
-    if selected == "mlp":
+    if selected in {"canonical_text_score_head", "mlp"}:
         logits, probability = predict_mlp(
             load_text_mlp(directory / "text_model.pt", device=device),
             features,
             device=device,
         )
+    elif selected == "logistic_regression":
+        raise ValueError(
+            "Logistic regression is an ablation and cannot be selected for production"
+        )
     else:
-        model = LogisticBaseline.load(directory / "text_logistic_baseline.json")
-        logits = model.predict_logits(features)
-        probability = model.predict_proba(features)
+        raise ValueError(f"Unknown canonical TextScoreHead selection: {selected}")
     return logits, probability, selected

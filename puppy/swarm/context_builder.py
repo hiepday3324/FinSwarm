@@ -38,7 +38,15 @@ def build_agent_context(
         long_memory=memories["long"],
         reflection_memory=memories["reflection"],
         memory_refs=refs,
-        shared_context=list(sector_agent.external_context_buffer),
+        shared_context=(
+            list(sector_agent.eligible_external_context(cur_date))
+            if hasattr(sector_agent, "eligible_external_context")
+            else [
+                item
+                for item in sector_agent.external_context_buffer
+                if item.created_at is None or item.created_at < cur_date
+            ]
+        ),
         shadow_state=shadow_state,
         psychology_state=psychology_state,
     )
@@ -51,7 +59,7 @@ def build_raw_context(context: AgentContext) -> str:
         f"Date: {context.date}",
     ]
     if context.latest_reason:
-        sections.append(f"Latest decision reason:\n{context.latest_reason}")
+        sections.append(f"Prior decision reason:\n{context.latest_reason}")
     sections.extend(
         [
             _format_text_list("Short memory", context.short_memory),
@@ -60,13 +68,24 @@ def build_raw_context(context: AgentContext) -> str:
             _format_text_list("Reflection memory", context.reflection_memory),
         ]
     )
-    shared_text = [
-        (
-            f"From {item.source_agent_id} ({item.source_symbol}) "
-            f"alpha={item.alpha}: {item.text}"
+    shared_text = []
+    for item in context.shared_context:
+        provenance = {
+            "source_agent_id": item.source_agent_id,
+            "target_agent_id": item.target_agent_id,
+            "source_symbol": item.source_symbol,
+            "target_symbol": item.target_symbol,
+            "alpha": item.alpha,
+            "created_at": item.created_at,
+            "reason": item.reason,
+            "memory_refs": [
+                ref.model_dump(mode="json") for ref in item.memory_refs
+            ],
+        }
+        shared_text.append(
+            f"Provenance: {json.dumps(provenance, default=_json_default, sort_keys=True)}\n"
+            f"Content: {item.text}"
         )
-        for item in context.shared_context
-    ]
     sections.append(_format_text_list("Shared context", shared_text))
     if context.shadow_state is not None:
         sections.append(_format_structured("Shadow state", context.shadow_state))

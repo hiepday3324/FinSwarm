@@ -82,6 +82,16 @@ class SectorAgent:
             )
         self.external_context_buffer.append(shared_context)
 
+    def eligible_external_context(self, current_date: date) -> list[SharedContext]:
+        """Return only context produced in a strictly earlier causal cycle."""
+
+        self.clear_expired_external_context(current_date)
+        return [
+            item
+            for item in self.external_context_buffer
+            if item.created_at is None or item.created_at < current_date
+        ]
+
     def clear_expired_external_context(self, current_date: date | None = None) -> None:
         if current_date is None:
             self.external_context_buffer = [

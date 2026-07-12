@@ -7,9 +7,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow.parquet as pq
 import torch
 
-from puppy.graph.torch_gat_model import DenseSignedGAT
+from puppy.graph.gat_model import DenseSignedGAT
+
+
+CanonicalGATModel = DenseSignedGAT
 
 from .checkpoint import (
     TrainOnlyScaler,
@@ -27,7 +31,9 @@ from .graph_dataset_loader import (
 )
 from .metrics import binary_metrics
 from .split import EffectiveSplits
+from .text_dataset import load_supervised_text_dataset
 from .text_embedding import sha256_path
+from .text_trainer import selected_text_predictions
 from .training_guard import SplitAccessGuard
 
 
@@ -71,6 +77,7 @@ def scale_graph_dataset(dataset: GraphDataset, scaler: TrainOnlyScaler) -> Graph
         label_mask=dataset.label_mask,
         decision_ids=dataset.decision_ids,
         feature_names=dataset.feature_names,
+        metadata=dict(dataset.metadata),
     )
 
 
@@ -81,10 +88,14 @@ def predict_gat(
     device: str = "cpu",
     batch_size: int = 256,
     include_attention: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    include_latent: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | tuple[
+    np.ndarray, np.ndarray, np.ndarray | None, np.ndarray
+]:
     model.eval()
     logits_batches: list[np.ndarray] = []
     attention_batches: list[np.ndarray] = []
+    latent_batches: list[np.ndarray] = []
     with torch.no_grad():
         for start in range(0, len(dataset), batch_size):
             features = torch.as_tensor(
@@ -102,19 +113,27 @@ def predict_gat(
                 dtype=torch.bool,
                 device=device,
             )
+            output = model(
+                features,
+                adjacency,
+                mask,
+                symbols=dataset.symbols,
+                feature_names=dataset.feature_names,
+                feature_provenance={"source": "canonical_graph_dataset"},
+            )
+            logits_batches.append(output.logits.cpu().numpy())
             if include_attention:
-                logits, attention = model(
-                    features, adjacency, mask, return_attention=True
-                )
-                attention_batches.append(attention.cpu().numpy())
-            else:
-                logits = model(features, adjacency, mask)
-            logits_batches.append(logits.cpu().numpy())
+                attention_batches.append(output.alpha.cpu().numpy())
+            if include_latent:
+                latent_batches.append(output.h_graph.cpu().numpy())
     logits_array = np.concatenate(logits_batches, axis=0)
     probability = 1.0 / (1.0 + np.exp(-np.clip(logits_array, -60.0, 60.0)))
     attention_array = (
         np.concatenate(attention_batches, axis=0) if attention_batches else None
     )
+    if include_latent:
+        latent_array = np.concatenate(latent_batches, axis=0)
+        return logits_array, probability, attention_array, latent_array
     return logits_array, probability, attention_array
 
 
@@ -183,8 +202,15 @@ def fit_gat(
             if not bool(label_mask.any()):
                 continue
             optimizer.zero_grad(set_to_none=True)
-            logits = model(features, adjacency, feature_mask)
-            losses = loss_function(logits, targets)
+            output = model(
+                features,
+                adjacency,
+                feature_mask,
+                symbols=train.symbols,
+                feature_names=train.feature_names,
+                feature_provenance={"source": "canonical_graph_dataset"},
+            )
+            losses = loss_function(output.logits, targets)
             loss = losses[label_mask].mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
@@ -245,8 +271,59 @@ def train_graph_stream(
     seed = config.seed if seed is None else int(seed)
     guard.assert_allowed("train", "scaler_fit")
     guard.assert_allowed("validation_selection", "early_stopping")
-    dataset = load_graph_dataset(config, splits, guard=guard)
-    train_raw = dataset.subset(splits.train_effective)
+    oof_path = config.model_dir / "oof_predictions.parquet"
+    if not oof_path.is_file():
+        raise FileNotFoundError(
+            "Canonical GAT training requires Text OOF predictions; run the oof stage first"
+        )
+    oof_rows = pq.read_table(oof_path).to_pylist()
+    text_scores = {
+        str(row["decision_id"]): float(row["text_probability"])
+        for row in oof_rows
+        if bool(row.get("text_prediction_is_oof"))
+    }
+    validation_text = load_supervised_text_dataset(
+        config,
+        splits,
+        guard=guard,
+        allowed_splits=("validation",),
+        allowed_dates=splits.validation_selection,
+        purpose="model_selection",
+    )
+    text_scaler = TrainOnlyScaler.load(config.model_dir / "text_scaler.json")
+    _, validation_text_probability, _ = selected_text_predictions(
+        config.model_dir,
+        text_scaler.transform(validation_text.embeddings),
+        device=device,
+    )
+    text_scores.update(
+        {
+            str(decision_id): float(probability)
+            for decision_id, probability in zip(
+                validation_text.decision_ids, validation_text_probability
+            )
+        }
+    )
+    dataset = load_graph_dataset(
+        config,
+        splits,
+        dates=splits.train_effective + splits.validation_selection,
+        guard=guard,
+        text_scores_by_decision=text_scores,
+    )
+    text_index = dataset.feature_names.index("text_score")
+    covered_train_dates = tuple(
+        date
+        for day, date in enumerate(dataset.dates)
+        if date in set(splits.train_effective)
+        and bool(dataset.label_mask[day].any())
+        and bool(
+            dataset.feature_mask[day, :, text_index][dataset.label_mask[day]].all()
+        )
+    )
+    if not covered_train_dates:
+        raise ValueError("No effective-train graph rows have OOF Text scores")
+    train_raw = dataset.subset(covered_train_dates)
     selection_raw = dataset.subset(splits.validation_selection)
     if not len(train_raw) or not len(selection_raw):
         raise ValueError("Graph train or validation-selection dataset is empty")
@@ -315,6 +392,7 @@ def train_graph_stream(
             label_mask=selection.label_mask[:2],
             decision_ids=selection.decision_ids[:2],
             feature_names=selection.feature_names,
+            metadata=dict(selection.metadata),
         ),
         device=device,
     )
@@ -337,6 +415,9 @@ def train_graph_stream(
             max(selection.dates).isoformat(),
         ],
         "train_days": len(train),
+        "train_manifest_effective_days": len(splits.train_effective),
+        "oof_text_covered_train_days": len(covered_train_dates),
+        "text_score_source": "oof_by_decision_id_for_train",
         "validation_selection_days": len(selection),
         "train_supervised_rows": train.supervised_count,
         "validation_selection_supervised_rows": selection.supervised_count,

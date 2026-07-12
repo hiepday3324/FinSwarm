@@ -2,30 +2,29 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pyarrow.dataset as ds
 import yaml
+
+from puppy.graph.graph_dataset import CANONICAL_FEATURE_NAMES
+from puppy.graph.graph_features import (
+    ACTION_FEATURE_NAMES,
+    MARKET_FEATURE_NAMES,
+    PSYCHOLOGY_FEATURE_NAMES,
+    SHADOW_FEATURE_NAMES,
+    TEXT_SCORE_FEATURE_NAMES,
+)
 
 from .config import TrainingConfig
 from .split import EffectiveSplits
 from .training_guard import SplitAccessGuard
 
 
-GRAPH_FEATURE_NAMES = (
-    "observed_close_return_1d",
-    "observed_intraday_return_1d",
-    "momentum_5d",
-    "momentum_20d",
-    "rolling_volatility_5d",
-    "rolling_volatility_20d",
-    "volume_ratio_20d",
-    "range_pct",
-    "feature_missing_count",
-)
+GRAPH_FEATURE_NAMES = CANONICAL_FEATURE_NAMES
 POLICY_DEPENDENT_GRAPH_FIELDS = {
     "action_signal",
     "shadow_roi_prior",
@@ -33,8 +32,10 @@ POLICY_DEPENDENT_GRAPH_FIELDS = {
     "shadow_drawdown_prior",
     "shadow_sharpe_prior",
     "shadow_win_rate_prior",
-    "text_norm",
-    "num_text_features",
+    "text_score",
+    "psychology_greed",
+    "psychology_fear",
+    "psychology_neutral",
 }
 
 
@@ -50,6 +51,7 @@ class GraphDataset:
     label_mask: np.ndarray
     decision_ids: np.ndarray
     feature_names: tuple[str, ...] = GRAPH_FEATURE_NAMES
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def subset(self, dates: Iterable[dt.date]) -> "GraphDataset":
         allowed = set(dates)
@@ -65,6 +67,7 @@ class GraphDataset:
             label_mask=self.label_mask[mask],
             decision_ids=self.decision_ids[mask],
             feature_names=self.feature_names,
+            metadata=dict(self.metadata),
         )
 
     def __len__(self) -> int:
@@ -96,6 +99,8 @@ def load_graph_dataset(
     dates: Iterable[dt.date] | None = None,
     purpose: str = "fit",
     guard: SplitAccessGuard | None = None,
+    text_scores_by_decision: Mapping[str, float] | None = None,
+    require_oof_text_scores: bool = False,
 ) -> GraphDataset:
     guard = guard or SplitAccessGuard()
     requested_dates = tuple(
@@ -139,9 +144,12 @@ def load_graph_dataset(
     missing = [name for name in GRAPH_FEATURE_NAMES if name not in source_names]
     if missing:
         raise ValueError(f"Stage 5 graph artifact is missing required features: {missing}")
-    if POLICY_DEPENDENT_GRAPH_FIELDS.intersection(GRAPH_FEATURE_NAMES):
-        raise AssertionError("Policy-dependent field entered Graph Stream v1 schema")
+    if tuple(source_names) != GRAPH_FEATURE_NAMES:
+        raise ValueError(
+            "Stage 5 graph artifact does not use the canonical H0 feature order"
+        )
     indices = [source_names.index(name) for name in GRAPH_FEATURE_NAMES]
+    text_score_index = GRAPH_FEATURE_NAMES.index("text_score")
 
     outcome_rows = _outcomes_for_dates(
         config.artifact_dir / "outcomes.parquet", requested_dates
@@ -190,6 +198,18 @@ def load_graph_dataset(
                 if outcome is None:
                     continue
                 day_ids[node] = outcome["decision_id"]
+                decision_id = str(outcome["decision_id"])
+                if text_scores_by_decision is not None:
+                    if decision_id in text_scores_by_decision:
+                        score = float(text_scores_by_decision[decision_id])
+                        if not 0.0 <= score <= 1.0:
+                            raise ValueError(
+                                f"OOF text score for {decision_id} is outside [0, 1]"
+                            )
+                        selected[node, text_score_index] = score
+                        selected_mask[node, text_score_index] = True
+                    elif require_oof_text_scores:
+                        raise ValueError(f"Missing OOF text score for {decision_id}")
                 label = int(outcome["direction_label"])
                 eligible = (
                     bool(outcome["train_mask"])
@@ -221,6 +241,16 @@ def load_graph_dataset(
         targets=np.stack(labels).astype(np.float32),
         label_mask=np.stack(label_masks).astype(bool),
         decision_ids=np.stack(decision_ids),
+        metadata={
+            "adapter_only": True,
+            "canonical_feature_order_verified": True,
+            "text_score_source": (
+                "oof_by_decision_id"
+                if text_scores_by_decision is not None
+                else "stage5_causal_or_pending_oof"
+            ),
+            "oof_text_scores_required": bool(require_oof_text_scores),
+        },
     )
     if result.features.shape[-1] != len(GRAPH_FEATURE_NAMES):
         raise AssertionError("Graph feature selection shape does not match selected schema")
@@ -229,8 +259,20 @@ def load_graph_dataset(
 
 def graph_feature_schema() -> dict[str, Any]:
     return {
-        "version": "graph-training-features-v1",
+        "version": "canonical-graph-features-v2",
         "feature_names": list(GRAPH_FEATURE_NAMES),
-        "excluded_policy_dependent_fields": sorted(POLICY_DEPENDENT_GRAPH_FIELDS),
+        "feature_blocks": {
+            "market_features": list(MARKET_FEATURE_NAMES),
+            "action_signal": list(ACTION_FEATURE_NAMES),
+            "text_score": list(TEXT_SCORE_FEATURE_NAMES),
+            "prior_shadow_features": list(SHADOW_FEATURE_NAMES),
+            "prior_psychology_features": list(PSYCHOLOGY_FEATURE_NAMES),
+        },
+        "required_policy_dependent_fields": sorted(POLICY_DEPENDENT_GRAPH_FIELDS),
+        "psychology_encoding": {
+            "greed": [1, 0, 0],
+            "fear": [0, 1, 0],
+            "neutral": [0, 0, 1],
+        },
         "targets_in_forward_inputs": False,
     }

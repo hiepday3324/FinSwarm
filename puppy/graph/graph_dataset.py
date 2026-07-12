@@ -9,28 +9,25 @@ import numpy as np
 from puppy.common.schemas import ObservedFeatureTable, QuantFeatureTable, ShadowPortfolioState, TextFeature
 from puppy.fusion.text_feature_contract import validate_text_feature_batch
 from puppy.graph.correlation_graph import build_correlation_adjacency
-from puppy.graph.graph_features import build_causal_node_features, build_node_features
+from puppy.graph.graph_features import (
+    ACTION_FEATURE_NAMES,
+    MARKET_FEATURE_NAMES,
+    PSYCHOLOGY_FEATURE_NAMES,
+    SHADOW_FEATURE_NAMES,
+    TEXT_SCORE_FEATURE_NAMES,
+    build_causal_node_features,
+    build_node_features,
+)
 
 
-FEATURE_NAMES = [
-    "action_signal",
-    "observed_close_return_1d",
-    "observed_intraday_return_1d",
-    "momentum_5d",
-    "momentum_20d",
-    "rolling_volatility_5d",
-    "rolling_volatility_20d",
-    "volume_ratio_20d",
-    "range_pct",
-    "shadow_roi_prior",
-    "shadow_rolling_return_prior",
-    "shadow_drawdown_prior",
-    "shadow_sharpe_prior",
-    "shadow_win_rate_prior",
-    "text_norm",
-    "num_text_features",
-    "feature_missing_count",
-]
+CANONICAL_FEATURE_NAMES = (
+    MARKET_FEATURE_NAMES
+    + ACTION_FEATURE_NAMES
+    + TEXT_SCORE_FEATURE_NAMES
+    + SHADOW_FEATURE_NAMES
+    + PSYCHOLOGY_FEATURE_NAMES
+)
+FEATURE_NAMES = list(CANONICAL_FEATURE_NAMES)
 
 LEGACY_FEATURE_NAMES = [
     "action_signal", "return", "label", "shadow_roi", "shadow_drawdown",
@@ -41,17 +38,33 @@ LEGACY_FEATURE_NAMES = [
 def build_causal_graph_sample(
     observed_table: ObservedFeatureTable,
     action_signals: dict[str, int],
-    shadow_states: dict[str, ShadowPortfolioState | None],
-    text_features: dict[str, TextFeature],
+    shadow_states: dict[str, ShadowPortfolioState | None] | None = None,
+    text_features: dict[str, TextFeature] | None = None,
     return_history: dict[str, list[float]] | None = None,
     return_source_dates: dict[str, list[Any]] | None = None,
+    *,
+    text_scores: dict[str, float | None] | None = None,
+    psychology_states: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     symbols = list(observed_table.symbols)
+    shadow_states = shadow_states or {}
+    text_features = text_features or {}
+    if text_scores is None:
+        text_scores = {
+            symbol: (
+                getattr(text_features[symbol], "metadata", {}).get("text_score")
+                if symbol in text_features
+                else None
+            )
+            for symbol in symbols
+        }
+    psychology_states = psychology_states or {symbol: None for symbol in symbols}
     node_features = build_causal_node_features(
         observed_table,
         action_signals,
+        text_scores,
         shadow_states,
-        text_features,
+        psychology_states,
     )
     values = [
         [node_features[symbol].get(name) for name in FEATURE_NAMES]
@@ -62,7 +75,17 @@ def build_causal_graph_sample(
         dtype=np.float32,
     )
     feature_mask = np.asarray(
-        [[value is not None for value in row] for row in values],
+        [
+            [
+                value is not None
+                and not (
+                    name == "text_score"
+                    and not node_features[symbol]["_availability"]["text_score"]
+                )
+                for name, value in zip(FEATURE_NAMES, row)
+            ]
+            for symbol, row in zip(symbols, values)
+        ],
         dtype=np.bool_,
     )
     source_dates = return_source_dates or {}
@@ -90,6 +113,20 @@ def build_causal_graph_sample(
         "adjacency_matrix": adjacency_matrix,
         "metadata": {
             "feature_names": list(FEATURE_NAMES),
+            "feature_blocks": {
+                "market_features": list(MARKET_FEATURE_NAMES),
+                "action_signal": list(ACTION_FEATURE_NAMES),
+                "text_score": list(TEXT_SCORE_FEATURE_NAMES),
+                "prior_shadow_features": list(SHADOW_FEATURE_NAMES),
+                "prior_psychology_features": list(PSYCHOLOGY_FEATURE_NAMES),
+            },
+            "feature_dimension": len(FEATURE_NAMES),
+            "text_score_source": (
+                "provided_causal_or_oof_score"
+                if all(text_scores.get(symbol) is not None for symbol in symbols)
+                else "pending_oof_replacement"
+            ),
+            "psychology_encoding": {"greed": [1, 0, 0], "fear": [0, 1, 0], "neutral": [0, 0, 1]},
             "targets_in_feature_matrix": False,
             "max_source_date": max_source_date.isoformat(),
             "decision_date": observed_table.date.isoformat(),

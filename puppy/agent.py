@@ -2,6 +2,7 @@ import os
 import shutil
 import pickle
 import logging
+import json
 from datetime import date
 from .run_type import RunMode
 from .memorydb import BrainDB
@@ -162,6 +163,56 @@ class LLMAgent(Agent):
             top_k=config["general"].get("top_k", 5),
             chat_config=config["chat"],
             look_back_window_size=config["general"]["look_back_window_size"],
+        )
+
+    def causal_decide(
+        self,
+        market_step: Any,
+        agent_context: Any,
+        run_context: Any,
+    ) -> Dict[str, Any]:
+        """Run the existing FinMem decision prompt on a frozen causal context."""
+
+        if market_step.date != agent_context.date or market_step.date != run_context.current_date:
+            raise ValueError("Causal decision inputs must share the decision date")
+        if market_step.as_of != run_context.current_cutoff:
+            raise ValueError("Causal decision cutoff mismatch")
+        short_memory = list(agent_context.short_memory)
+        if agent_context.shadow_state is not None:
+            short_memory.append(
+                "Prior ShadowPortfolio state: "
+                + json.dumps(agent_context.shadow_state, sort_keys=True, default=str)
+            )
+        if agent_context.psychology_state is not None:
+            short_memory.append(
+                "Prior Psychology state: "
+                + json.dumps(agent_context.psychology_state, sort_keys=True, default=str)
+            )
+        for shared in agent_context.shared_context:
+            short_memory.append(
+                "Causally eligible shared context with provenance: "
+                + json.dumps(shared.model_dump(mode="json"), sort_keys=True, default=str)
+            )
+
+        def ids(values: List[str], offset: int) -> List[int]:
+            return [offset + index for index in range(len(values))]
+
+        return trading_reflection(
+            cur_date=market_step.date,
+            endpoint_func=self.guardrail_endpoint,
+            symbol=self.trading_symbol,
+            run_mode=RunMode.Test,
+            logger=self.logger,
+            momentum=None,
+            future_record=None,
+            short_memory=short_memory,
+            short_memory_id=ids(short_memory, 100000),
+            mid_memory=list(agent_context.mid_memory),
+            mid_memory_id=ids(list(agent_context.mid_memory), 200000),
+            long_memory=list(agent_context.long_memory),
+            long_memory_id=ids(list(agent_context.long_memory), 300000),
+            reflection_memory=list(agent_context.reflection_memory),
+            reflection_memory_id=ids(list(agent_context.reflection_memory), 400000),
         )
 
     def _handling_filings(self, cur_date: date, filing_q: str, filing_k: str) -> None:

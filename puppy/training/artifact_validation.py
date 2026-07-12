@@ -10,6 +10,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from puppy.data_engine.normalization import load_stage4_config
+from puppy.graph.graph_dataset import CANONICAL_FEATURE_NAMES
 
 from .rollout_state import atomic_write_json, atomic_write_text, sha256_path
 from .temporal_assertions import FORBIDDEN_GRAPH_FIELDS
@@ -106,6 +107,11 @@ def validate_training_artifacts(config_path: str, run_id: str) -> dict[str, Any]
         alignment += int(pending is None or pending["expected_outcome_date"] != outcome["outcome_date"])
         alignment += int(outcome["available_at"] <= (pending["decision_cutoff"] if pending else outcome["available_at"]))
     graph_names = feature_schema["graph_feature_names"]
+    if tuple(graph_names) != CANONICAL_FEATURE_NAMES:
+        raise ValueError(
+            "Stage 5 graph artifacts require regeneration: expected canonical "
+            "market/action/text_score/prior_shadow/prior_psychology feature order"
+        )
     forbidden = sorted(FORBIDDEN_GRAPH_FIELDS.intersection(graph_names))
     graph_violations = len(forbidden)
     graph_violations += int(graph["feature_matrix"].shape[-1] != len(graph_names))
@@ -151,6 +157,16 @@ def validate_training_artifacts(config_path: str, run_id: str) -> dict[str, Any]
             "forbidden_fields_found": forbidden,
             "maximum_source_date_leq_decision_date": graph_future == 0,
             "targets_separate": graph_violations == 0,
+        },
+        "action_audit": {
+            "source": data_manifest.get("action_source")
+            or data_manifest.get("bootstrap_policy")
+            or "unknown",
+            "bootstrap": bool(data_manifest.get("bootstrap")),
+            "final_training_eligible": (
+                data_manifest.get("action_source") == "real_causal_sector_agent"
+                and not bool(data_manifest.get("bootstrap"))
+            ),
         },
     }
     atomic_write_json(output_dir / "temporal_quality.json", report)

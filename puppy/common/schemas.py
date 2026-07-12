@@ -122,6 +122,10 @@ class MemoryShareRoute(SwarmBaseModel):
     source_symbol: str
     target_symbol: str
     alpha: float
+    memory_id: int | str | None = None
+    memory_importance: float = 1.0
+    routing_score: float | None = None
+    routing_threshold: float = 0.5
     reason: str
     layer: MemoryLayer | str = MemoryLayer.SHORT
     top_k: int = 3
@@ -240,7 +244,12 @@ class GraphOutput(SwarmBaseModel):
     node_features: dict[str, dict[str, Any]] = Field(default_factory=dict)
     adjacency: dict[str, dict[str, float]] = Field(default_factory=dict)
     graph_scores: dict[str, float] = Field(default_factory=dict)
+    graph_logits: dict[str, float] = Field(default_factory=dict)
+    graph_probabilities: dict[str, float] = Field(default_factory=dict)
+    graph_embeddings: dict[str, list[float]] = Field(default_factory=dict)
     attention: dict[str, dict[str, float]] = Field(default_factory=dict)
+    feature_names: list[str] = Field(default_factory=list)
+    feature_provenance: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -251,6 +260,11 @@ class FusionOutput(SwarmBaseModel):
     graph_scores: dict[str, float] = Field(default_factory=dict)
     fusion_scores: dict[str, float] = Field(default_factory=dict)
     gates: dict[str, float] = Field(default_factory=dict)
+    vector_gates: dict[str, list[float]] = Field(default_factory=dict)
+    text_projected: dict[str, list[float]] = Field(default_factory=dict)
+    graph_projected: dict[str, list[float]] = Field(default_factory=dict)
+    final_embeddings: dict[str, list[float]] = Field(default_factory=dict)
+    final_logits: dict[str, float] = Field(default_factory=dict)
     conflict_flags: dict[str, bool] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

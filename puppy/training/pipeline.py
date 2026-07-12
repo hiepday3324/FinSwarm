@@ -17,7 +17,7 @@ from .text_trainer import train_text_stream
 from .training_guard import SplitAccessGuard
 
 
-STAGES = ("verify", "embed", "split", "text", "graph", "oof", "fusion", "calibrate", "bundle")
+STAGES = ("verify", "embed", "split", "text", "oof", "graph", "fusion", "calibrate", "bundle")
 
 
 def effective_splits(config: TrainingConfig) -> EffectiveSplits:
@@ -57,11 +57,29 @@ def verify_causal_inputs(config: TrainingConfig) -> dict[str, Any]:
     )
     if rollout.get("status") != "complete" or rollout.get("temporal_gate") != "PASS":
         raise ValueError("Stage 5 rollout is incomplete or its temporal gate failed")
+    data_manifest = json.loads(
+        (config.artifact_dir / "data_manifest.json").read_text(encoding="utf-8")
+    )
+    bootstrap = bool(data_manifest.get("bootstrap") or rollout.get("bootstrap"))
+    real_actions = (
+        not bootstrap
+        and data_manifest.get("action_source") == "real_causal_sector_agent"
+        and not data_manifest.get("bootstrap_policy")
+    )
+    if not real_actions:
+        policy = data_manifest.get("bootstrap_policy", "unknown")
+        raise ValueError(
+            "Final canonical training rejects bootstrap action artifacts; "
+            f"action_source={policy}, external_llm_used="
+            f"{bool(data_manifest.get('external_llm_used'))}. Regenerate Stage 5 "
+            "with real causal SectorAgent decisions."
+        )
     return {
         "status": "PASS",
         "temporal_gate": "PASS",
         "run_id": rollout.get("run_id"),
         "artifact_counts": rollout.get("artifact_counts", {}),
+        "action_source": "real_causal_sector_agent",
     }
 
 

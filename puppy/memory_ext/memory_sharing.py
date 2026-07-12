@@ -21,6 +21,7 @@ class MemorySharingService:
         target_agent: Any,
     ) -> MemoryShareEvent:
         memories = self._search_memory(route=route, source_memory_store=source_memory_store)
+        memories = self._eligible_memories(route, memories)
         memory_refs = [
             self._memory_to_ref(memory=memory, route=route) for memory in memories
         ]
@@ -55,6 +56,29 @@ class MemorySharingService:
             shared_memory_ids=memory_ids,
             deduped=deduped,
         )
+
+    def _eligible_memories(
+        self,
+        route: MemoryShareRoute,
+        memories: list[Any],
+    ) -> list[Any]:
+        eligible = []
+        for memory in memories:
+            memory_id = self._memory_value(
+                memory, "memory_id", self._memory_value(memory, "id", None)
+            )
+            if route.memory_id is not None and memory_id != route.memory_id:
+                continue
+            importance = self._memory_value(
+                memory, "importance", route.memory_importance
+            )
+            try:
+                routing_score = float(route.alpha) * float(importance)
+            except (TypeError, ValueError):
+                continue
+            if routing_score > float(route.routing_threshold):
+                eligible.append(memory)
+        return eligible
 
     def apply_memory_share_routes(
         self,
@@ -140,6 +164,18 @@ class MemorySharingService:
             score=self._memory_value(memory, "score", None),
             source_agent_id=route.source_agent_id,
             text_preview=text[:160] if isinstance(text, str) else None,
+            metadata={
+                "importance": self._memory_value(
+                    memory, "importance", route.memory_importance
+                ),
+                "routing_score": float(route.alpha)
+                * float(
+                    self._memory_value(
+                        memory, "importance", route.memory_importance
+                    )
+                ),
+                "routing_threshold": route.routing_threshold,
+            },
         )
 
     def _summarize(self, route: MemoryShareRoute, memories: list[Any]) -> str:

@@ -13,10 +13,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-from puppy.fusion.trainable_gated_fusion import TrainableGatedFusion
-from puppy.fusion.trainable_text_head import TrainableTextHead
-from puppy.graph.gat_model import NumpyGATScorer
-from puppy.graph.torch_gat_model import DenseSignedGAT
+from puppy.fusion.gated_fusion import LatentGatedFusion
+from puppy.fusion.text_score_head import TextScoreHead
+from puppy.graph.gat_model import DenseSignedGAT, NumpyGATScorer
 from puppy.training.calibration import fit_temperature
 from puppy.training.checkpoint import (
     TrainOnlyScaler,
@@ -86,7 +85,7 @@ def _config(root: Path) -> TrainingConfig:
             "normalize": True,
             "max_length": 512,
             "batch_size": 4,
-            "text_view_version": "causal-memory-only-v1",
+            "text_view_version": "full-causal-agent-context-v1",
         },
         "split": {
             "embargo_trading_days": 20,
@@ -155,6 +154,7 @@ def _pending() -> dict[str, object]:
         "reflection_memory": ["FORBIDDEN_REFLECTION"],
         "shadow_state": {"secret": "FORBIDDEN_SHADOW"},
         "shared_context": ["FORBIDDEN_SHARED"],
+        "psychology_state": {"state": "fear"},
     }
     return {
         "decision_id": "decision",
@@ -162,6 +162,7 @@ def _pending() -> dict[str, object]:
         "decision_date": dt.date(2025, 1, 2),
         "context_hash": "context-hash",
         "context_snapshot": {"agent_context": context},
+        "reason": "FORBIDDEN_CURRENT_DECISION_REASON",
     }
 
 
@@ -191,17 +192,19 @@ class Stage6TextEmbeddingTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_semantic_embedding_artifact(Path(directory) / "missing.parquet", manifest)
 
-    def test_semantic_view_excludes_bootstrap_decision_reason(self) -> None:
+    def test_semantic_view_excludes_current_decision_reason(self) -> None:
         text, _ = canonical_memory_text(_pending())
-        self.assertNotIn("FORBIDDEN_REASON", text)
+        self.assertNotIn("FORBIDDEN_CURRENT_DECISION_REASON", text)
+        self.assertIn("FORBIDDEN_REASON", text)
 
-    def test_semantic_view_excludes_reflection_memory(self) -> None:
+    def test_semantic_view_includes_eligible_reflection_memory(self) -> None:
         text, _ = canonical_memory_text(_pending())
-        self.assertNotIn("FORBIDDEN_REFLECTION", text)
+        self.assertIn("FORBIDDEN_REFLECTION", text)
 
-    def test_semantic_view_excludes_shadow_portfolio_state(self) -> None:
+    def test_semantic_view_includes_prior_shadow_and_psychology(self) -> None:
         text, _ = canonical_memory_text(_pending())
-        self.assertNotIn("FORBIDDEN_SHADOW", text)
+        self.assertIn("FORBIDDEN_SHADOW", text)
+        self.assertIn('"state": "fear"', text)
 
     def test_semantic_embedding_dimension_is_384(self) -> None:
         self.assertEqual(_semantic_encoder().encode(["alpha"]).shape, (1, 384))
@@ -450,9 +453,9 @@ class Stage6TextModelTest(unittest.TestCase):
 
     def test_different_seed_changes_initial_text_parameters(self) -> None:
         seed_everything(1)
-        first = TrainableTextHead(input_dim=4, hidden_dim=8, dropout=0)
+        first = TextScoreHead(input_dim=4, hidden_dim=8, dropout=0)
         seed_everything(2)
-        second = TrainableTextHead(input_dim=4, hidden_dim=8, dropout=0)
+        second = TextScoreHead(input_dim=4, hidden_dim=8, dropout=0)
         self.assertNotEqual(state_dict_sha256(first.state_dict()), state_dict_sha256(second.state_dict()))
 
 
@@ -494,14 +497,15 @@ def _graph_config() -> dict[str, object]:
 
 
 class Stage6GraphModelTest(unittest.TestCase):
-    def test_graph_features_exclude_action_signal(self) -> None:
-        self.assertNotIn("action_signal", GRAPH_FEATURE_NAMES)
+    def test_graph_features_include_action_signal(self) -> None:
+        self.assertIn("action_signal", GRAPH_FEATURE_NAMES)
 
     def test_graph_features_exclude_text_features(self) -> None:
+        self.assertIn("text_score", GRAPH_FEATURE_NAMES)
         self.assertTrue({"text_norm", "num_text_features"}.isdisjoint(GRAPH_FEATURE_NAMES))
 
-    def test_graph_features_exclude_bootstrap_shadow_metrics(self) -> None:
-        self.assertTrue(POLICY_DEPENDENT_GRAPH_FIELDS.isdisjoint(GRAPH_FEATURE_NAMES))
+    def test_graph_features_include_prior_state_contract(self) -> None:
+        self.assertTrue(POLICY_DEPENDENT_GRAPH_FIELDS.issubset(GRAPH_FEATURE_NAMES))
 
     def test_gat_parameters_change_after_backward(self) -> None:
         graph = _graph_dataset()
@@ -513,7 +517,8 @@ class Stage6GraphModelTest(unittest.TestCase):
         model = DenseSignedGAT(3, hidden_dim=4, num_heads=2, dropout=0)
         graph = _graph_dataset()
         output = model(torch.tensor(graph.features), torch.tensor(graph.adjacency), torch.tensor(graph.feature_mask))
-        self.assertEqual(tuple(output.shape), (4, 3))
+        self.assertEqual(tuple(output.logits.shape), (4, 3))
+        self.assertEqual(tuple(output.h_graph.shape), (4, 3, 8))
 
     def test_gat_attention_respects_adjacency_mask(self) -> None:
         model = DenseSignedGAT(2, hidden_dim=2, num_heads=2, dropout=0).eval()
@@ -530,7 +535,12 @@ class Stage6GraphModelTest(unittest.TestCase):
         mask = torch.ones_like(features, dtype=torch.bool)
         positive = torch.tensor([[[1.0, 0.8], [0.8, 1.0]]])
         negative = torch.tensor([[[1.0, -0.8], [-0.8, 1.0]]])
-        self.assertFalse(torch.allclose(model(features, positive, mask), model(features, negative, mask)))
+        self.assertFalse(
+            torch.allclose(
+                model(features, positive, mask).logits,
+                model(features, negative, mask).logits,
+            )
+        )
 
     def test_gat_save_load_prediction_equivalence(self) -> None:
         graph = _graph_dataset()
@@ -578,11 +588,18 @@ class Stage6OOFTest(unittest.TestCase):
 
 
 def _fusion_values() -> dict[str, np.ndarray]:
+    text_logit = np.asarray([-2, -1, -0.5, -0.2, 0.2, 0.5, 1, 2], dtype=np.float32)
+    graph_logit = np.asarray([-1, -2, 0.2, -0.3, 0.4, -0.1, 2, 1], dtype=np.float32)
     return {
-        "text_logit": np.asarray([-2, -1, -0.5, -0.2, 0.2, 0.5, 1, 2], dtype=np.float32),
-        "graph_logit": np.asarray([-1, -2, 0.2, -0.3, 0.4, -0.1, 2, 1], dtype=np.float32),
-        "text_available": np.ones(8, dtype=bool),
-        "graph_available": np.ones(8, dtype=bool),
+        "h_text": np.stack([text_logit, text_logit**2, np.ones(8)], axis=1),
+        "h_graph": np.stack(
+            [graph_logit, graph_logit**2, np.ones(8), text_logit - graph_logit],
+            axis=1,
+        ),
+        "text_logit": text_logit,
+        "graph_logit": graph_logit,
+        "text_probability": 1.0 / (1.0 + np.exp(-text_logit)),
+        "graph_probability": 1.0 / (1.0 + np.exp(-graph_logit)),
         "target": np.asarray([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.float32),
         "symbol": np.asarray(["TSLA", "NVDA", "AAPL", "TSLA", "NVDA", "AAPL", "TSLA", "NVDA"]),
     }
@@ -590,7 +607,7 @@ def _fusion_values() -> dict[str, np.ndarray]:
 
 def _fusion_config() -> dict[str, object]:
     return {
-        "hidden_dim": 4,
+        "latent_dim": 4,
         "dropout": 0.0,
         "learning_rate": 0.01,
         "weight_decay": 0.0,
@@ -603,7 +620,16 @@ def _fusion_config() -> dict[str, object]:
 class Stage6FusionCalibrationTest(unittest.TestCase):
     def test_fusion_accepts_valid_oof_rows(self) -> None:
         validate_oof_rows(
-            [{"is_oof": True, "model_train_end": dt.date(2025, 1, 1), "decision_date": dt.date(2025, 1, 22), "embargo_trading_days": 20}],
+            [{
+                "is_oof": True,
+                "text_prediction_is_oof": True,
+                "graph_representation_is_oof": True,
+                "h_text": [0.1, 0.2],
+                "h_graph": [0.3, 0.4],
+                "model_train_end": dt.date(2025, 1, 1),
+                "decision_date": dt.date(2025, 1, 22),
+                "embargo_trading_days": 20,
+            }],
             20,
         )
 
@@ -618,23 +644,21 @@ class Stage6FusionCalibrationTest(unittest.TestCase):
             path = Path(directory) / "fusion.pt"
             atomic_torch_save(
                 path,
-                {"architecture": model.architecture_config(), "state_dict": model.state_dict(), "selected_fusion_model": "trainable_gated_fusion"},
+                {"architecture": model.architecture_config(), "state_dict": model.state_dict(), "selected_fusion_model": "canonical_latent_fusion"},
             )
             loaded, selected = load_fusion_model(path)
             actual = predict_fusion(loaded, _fusion_values())[0]
-        self.assertEqual(selected, "trainable_gated_fusion")
+        self.assertEqual(selected, "canonical_latent_fusion")
         self.assertTrue(np.allclose(expected, actual))
 
-    def test_missing_stream_fallback_is_deterministic(self) -> None:
-        model = TrainableGatedFusion(hidden_dim=4, dropout=0).eval()
-        text = torch.tensor([1.25, 9.0])
-        graph = torch.tensor([8.0, -0.75])
-        output = model(text, graph, torch.tensor([True, False]), torch.tensor([False, True]))
-        self.assertTrue(torch.equal(output, torch.tensor([1.25, -0.75])))
+    def test_scalar_only_inputs_are_rejected(self) -> None:
+        model = LatentGatedFusion(text_dim=3, graph_dim=4, latent_dim=4, dropout=0).eval()
+        with self.assertRaises(ValueError):
+            model(torch.tensor([1.25, 9.0]), torch.tensor([8.0, -0.75]))
 
     def test_fixed_average_baseline_is_reported(self) -> None:
         values = _fusion_values()
-        model = TrainableGatedFusion(hidden_dim=4, dropout=0)
+        model = LatentGatedFusion(text_dim=3, graph_dim=4, latent_dim=4, dropout=0)
         probability = predict_fusion(model, values)[1]
         self.assertIn("fixed_0.5_average", _candidate_metrics(values, probability))
 
@@ -647,7 +671,7 @@ class Stage6FusionCalibrationTest(unittest.TestCase):
         self.assertGreater(fit_temperature(values["text_logit"], values["target"]), 0)
 
     def test_temperature_fitting_does_not_change_fusion_weights(self) -> None:
-        model = TrainableGatedFusion(hidden_dim=4, dropout=0)
+        model = LatentGatedFusion(text_dim=3, graph_dim=4, latent_dim=4, dropout=0)
         before = state_dict_sha256(model.state_dict())
         values = _fusion_values()
         fit_temperature(values["text_logit"], values["target"])
@@ -688,12 +712,17 @@ class Stage6BundleAndMetricsTest(unittest.TestCase):
         text_logits = predict_mlp(text_model, text_x)[0]
         graph = _graph_dataset()
         graph_model, _ = fit_gat(graph, graph, _graph_config(), seed=4, fixed_epochs=2)
-        graph_logits = predict_gat(graph_model, graph)[0].reshape(-1)[:6]
+        graph_logits, graph_probability, _, graph_latent = predict_gat(
+            graph_model, graph, include_latent=True
+        )
+        graph_logits = graph_logits.reshape(-1)[:6]
         values = {
+            "h_text": text_x,
+            "h_graph": graph_latent.reshape(-1, graph_latent.shape[-1])[:6],
             "text_logit": text_logits,
             "graph_logit": graph_logits,
-            "text_available": np.ones(6, dtype=bool),
-            "graph_available": np.ones(6, dtype=bool),
+            "text_probability": 1.0 / (1.0 + np.exp(-text_logits)),
+            "graph_probability": graph_probability.reshape(-1)[:6],
             "target": targets,
             "symbol": np.asarray(["TSLA", "NVDA", "AAPL", "TSLA", "NVDA", "AAPL"]),
         }
@@ -708,7 +737,7 @@ class Stage6BundleAndMetricsTest(unittest.TestCase):
 
     def test_numpy_mvp_gat_remains_a_separate_baseline(self) -> None:
         self.assertIsNot(NumpyGATScorer, DenseSignedGAT)
-        self.assertNotEqual(NumpyGATScorer.__module__, DenseSignedGAT.__module__)
+        self.assertEqual(NumpyGATScorer.__module__, DenseSignedGAT.__module__)
 
 
 if __name__ == "__main__":

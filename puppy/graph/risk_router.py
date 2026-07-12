@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from puppy.common.enums import MemoryLayer
 from puppy.common.schemas import GraphOutput, MemoryShareRoute
 
@@ -12,8 +14,9 @@ def build_memory_share_routes(
     threshold: float = 0.5,
     top_k: int = 3,
     layer: MemoryLayer | str = MemoryLayer.SHORT,
+    importance_by_source: Mapping[str, float] | None = None,
 ) -> list[MemoryShareRoute]:
-    """Emit memory sharing routes from graph attention weights."""
+    """Emit routes only when ``Alpha[target, source] * Importance > theta``."""
 
     routes: list[MemoryShareRoute] = []
     for target_symbol, sources in graph_output.attention.items():
@@ -21,7 +24,11 @@ def build_memory_share_routes(
         if target_agent_id is None:
             continue
         for source_symbol, alpha in sources.items():
-            if source_symbol == target_symbol or alpha < threshold:
+            importance = float(
+                (importance_by_source or {}).get(source_symbol, 1.0)
+            )
+            routing_score = float(alpha) * importance
+            if source_symbol == target_symbol or routing_score <= threshold:
                 continue
             source_agent_id = agent_by_symbol.get(source_symbol)
             if source_agent_id is None:
@@ -34,9 +41,13 @@ def build_memory_share_routes(
                     source_symbol=source_symbol,
                     target_symbol=target_symbol,
                     alpha=float(alpha),
+                    memory_importance=importance,
+                    routing_score=routing_score,
+                    routing_threshold=float(threshold),
                     reason=(
                         f"{source_symbol} influences {target_symbol} through "
-                        f"graph attention alpha={float(alpha):.4f}."
+                        f"alpha={float(alpha):.4f} * importance={importance:.4f} "
+                        f"= {routing_score:.4f} > theta={float(threshold):.4f}."
                     ),
                     layer=layer,
                     top_k=top_k,
@@ -48,4 +59,8 @@ def build_memory_share_routes(
                 )
             )
 
-    return sorted(routes, key=lambda route: route.alpha, reverse=True)
+    return sorted(
+        routes,
+        key=lambda route: float(route.routing_score or 0.0),
+        reverse=True,
+    )

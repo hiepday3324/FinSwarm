@@ -12,6 +12,11 @@ import numpy as np
 import pyarrow.dataset as ds
 import torch
 
+from puppy.fusion.gated_fusion import LatentGatedFusion
+from puppy.fusion.text_encoder import TextStreamEncoder
+from puppy.fusion.text_score_head import TextScoreHead
+from puppy.graph.gat_model import DenseSignedGAT
+
 from .checkpoint import TrainOnlyScaler, atomic_json
 from .config import TRAINING_CODE_VERSION, TrainingConfig, training_code_sha256
 from .fusion_trainer import (
@@ -24,6 +29,7 @@ from .split import EffectiveSplits
 from .text_dataset import load_supervised_text_dataset
 from .text_embedding import sha256_path
 from .text_trainer import selected_text_predictions
+from .text_trainer import load_text_mlp
 from .training_guard import SplitAccessGuard
 
 
@@ -57,6 +63,16 @@ REQUIRED_GENERATED_FILES = (
 )
 
 
+@dataclass(frozen=True)
+class CanonicalModelSet:
+    text_encoder: TextStreamEncoder
+    text_score_head: TextScoreHead
+    gat: DenseSignedGAT
+    fusion: LatentGatedFusion
+    text_scaler: TrainOnlyScaler
+    graph_scaler: TrainOnlyScaler
+
+
 def _git_commit(root: Path) -> str:
     try:
         return subprocess.run(
@@ -83,6 +99,9 @@ def _metrics_and_audit(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     temporal = json.loads(
         (config.artifact_dir / "temporal_quality.json").read_text(encoding="utf-8")
+    )
+    data_manifest = json.loads(
+        (config.artifact_dir / "data_manifest.json").read_text(encoding="utf-8")
     )
     embedding = json.loads(
         (config.artifact_dir / "text_embedding_manifest.json").read_text(encoding="utf-8")
@@ -168,19 +187,25 @@ def _metrics_and_audit(
         "oof_test_access_zero": int(oof["test_access_count"]) == 0,
         "fusion_oof_only": bool(fusion["oof_only_verified"]),
         "fusion_parameters_changed": bool(fusion["parameter_changed"]),
+        "canonical_fusion_selected": fusion["selected_fusion_model"]
+        == "canonical_latent_fusion",
+        "oof_text_for_graph_verified": bool(oof["oof_text_for_graph_verified"]),
+        "oof_graph_latents_verified": bool(oof["oof_graph_latents_verified"]),
         "calibration_partition_only": calibration["partition"]
         == "validation_calibration",
         "calibration_weights_unchanged": bool(calibration["fusion_weights_unchanged"]),
         "no_test_metrics": "test" not in json.dumps(metrics).lower(),
         "test_feature_values_loaded": False,
-        "policy_dependent_graph_fields_used": False,
+        "real_causal_action_source": data_manifest.get("action_source")
+        == "real_causal_sector_agent"
+        and not bool(data_manifest.get("bootstrap")),
+        "policy_dependent_graph_fields_used": True,
         "targets_in_graph_forward_inputs": False,
     }
     pass_checks = {
         key: (not value if key in {
             "test_embedding_materialized",
             "test_feature_values_loaded",
-            "policy_dependent_graph_fields_used",
             "targets_in_graph_forward_inputs",
         } else value)
         for key, value in checks.items()
@@ -268,35 +293,46 @@ def _create_prediction_probe(
         purpose="model_selection",
     )
     date = text_data.dates[0]
-    symbol = str(text_data.symbols[0])
+    date_text = text_data.subset((date,))
+    symbol = str(date_text.symbols[0])
+    text_scaler = TrainOnlyScaler.load(config.model_dir / "text_scaler.json")
+    graph_scaler = TrainOnlyScaler.load(config.model_dir / "graph_scaler.json")
+    text_features = text_scaler.transform(date_text.embeddings)
+    text_logits, text_probability, selected_text = selected_text_predictions(
+        config.model_dir, text_features, device=device
+    )
+    text_scores = {
+        str(decision_id): float(probability)
+        for decision_id, probability in zip(date_text.decision_ids, text_probability)
+    }
     graph_raw = load_graph_dataset(
         config,
         splits,
         dates=(date,),
         purpose="model_selection",
         guard=guard,
+        text_scores_by_decision=text_scores,
+        require_oof_text_scores=True,
     )
-    text_scaler = TrainOnlyScaler.load(config.model_dir / "text_scaler.json")
-    graph_scaler = TrainOnlyScaler.load(config.model_dir / "graph_scaler.json")
-    text_features = text_scaler.transform(text_data.embeddings[:1])
     graph = scale_graph_dataset(graph_raw, graph_scaler)
-    text_logits, _, selected_text = selected_text_predictions(
-        config.model_dir, text_features, device=device
-    )
-    graph_logits, _, _ = predict_gat(
+    graph_logits, graph_probability, _, h_graph = predict_gat(
         load_gat(config.model_dir / "graph_model.pt", device=device),
         graph,
         device=device,
+        include_latent=True,
     )
     node = graph.symbols.index(symbol)
+    text_index = list(date_text.symbols).index(symbol)
     fusion_model, selected_fusion = load_fusion_model(
         config.model_dir / "fusion_model.pt", device=device
     )
     fusion_values = {
-        "text_logit": np.asarray([text_logits[0]], dtype=np.float32),
+        "h_text": date_text.embeddings[text_index : text_index + 1].astype(np.float32),
+        "h_graph": h_graph[0, node][None].astype(np.float32),
+        "text_logit": np.asarray([text_logits[text_index]], dtype=np.float32),
         "graph_logit": np.asarray([graph_logits[0, node]], dtype=np.float32),
-        "text_available": np.asarray([True]),
-        "graph_available": np.asarray([True]),
+        "text_probability": np.asarray([text_probability[text_index]], dtype=np.float32),
+        "graph_probability": np.asarray([graph_probability[0, node]], dtype=np.float32),
     }
     fusion_logit = selected_fusion_logits(
         fusion_model, selected_fusion, fusion_values, device=device
@@ -311,16 +347,20 @@ def _create_prediction_probe(
     temporary = target.with_suffix(".tmp.npz")
     np.savez_compressed(
         temporary,
-        decision_id=np.asarray(str(text_data.decision_ids[0])),
+        decision_id=np.asarray(str(date_text.decision_ids[text_index])),
         symbol=np.asarray(symbol),
         decision_date=np.asarray(date.isoformat()),
         node_index=np.asarray(node, dtype=np.int16),
-        text_features=text_features.astype(np.float32),
+        h_text=fusion_values["h_text"],
+        text_features=text_features[text_index : text_index + 1].astype(np.float32),
         graph_features=graph.features.astype(np.float32),
         graph_adjacency=graph.adjacency.astype(np.float32),
         graph_feature_mask=graph.feature_mask.astype(bool),
-        expected_text_logit=np.asarray(text_logits[0], dtype=np.float64),
+        expected_h_graph=fusion_values["h_graph"],
+        expected_text_logit=np.asarray(text_logits[text_index], dtype=np.float64),
+        expected_text_probability=np.asarray(text_probability[text_index], dtype=np.float64),
         expected_graph_logit=np.asarray(graph_logits[0, node], dtype=np.float64),
+        expected_graph_probability=np.asarray(graph_probability[0, node], dtype=np.float64),
         expected_fusion_logit=np.asarray(fusion_logit, dtype=np.float64),
         expected_calibrated_probability=np.asarray(calibrated_probability, dtype=np.float64),
         selected_text_model=np.asarray(selected_text),
@@ -328,7 +368,7 @@ def _create_prediction_probe(
     )
     os.replace(temporary, target)
     return {
-        "decision_id": str(text_data.decision_ids[0]),
+        "decision_id": str(date_text.decision_ids[text_index]),
         "date": date.isoformat(),
         "symbol": symbol,
         "selected_text_model": selected_text,
@@ -391,7 +431,7 @@ def build_model_bundle(
         (config.model_dir / "fusion_training_history.json").read_text(encoding="utf-8")
     )
     manifest = {
-        "bundle_version": "finswarm-stage6-bundle-v1",
+        "bundle_version": "finswarm-canonical-bundle-v2",
         "training_code_version": TRAINING_CODE_VERSION,
         "training_code_sha256": training_code_sha256(config.repo_root),
         "git_commit": git_commit,
@@ -400,6 +440,12 @@ def build_model_bundle(
         "numpy_version": np.__version__,
         "encoder_model": embedding["encoder_model"],
         "encoder_revision": embedding["encoder_revision"],
+        "canonical_classes": {
+            "text_encoder": "puppy.fusion.text_encoder.TextStreamEncoder",
+            "text_score_head": "puppy.fusion.text_score_head.TextScoreHead",
+            "gat": "puppy.graph.gat_model.DenseSignedGAT",
+            "fusion": "puppy.fusion.gated_fusion.LatentGatedFusion",
+        },
         "input_artifact_hashes": {
             "data_manifest": files["source_data_manifest.json"],
             "rollout_manifest": files["source_rollout_manifest.json"],
@@ -442,16 +488,58 @@ class ModelBundle:
     def load(cls, path: str | Path) -> "ModelBundle":
         directory = Path(path)
         manifest = json.loads((directory / "bundle_manifest.json").read_text(encoding="utf-8"))
+        selected = manifest.get("selected_fusion_model")
+        if selected is not None and selected != "canonical_latent_fusion":
+            raise ValueError(
+                "Production model bundle must select canonical latent fusion; "
+                f"found {selected!r}"
+            )
+        if manifest.get("bundle_version") == "finswarm-canonical-bundle-v2":
+            expected_classes = {
+                "text_encoder": "puppy.fusion.text_encoder.TextStreamEncoder",
+                "text_score_head": "puppy.fusion.text_score_head.TextScoreHead",
+                "gat": "puppy.graph.gat_model.DenseSignedGAT",
+                "fusion": "puppy.fusion.gated_fusion.LatentGatedFusion",
+            }
+            if manifest.get("canonical_classes") != expected_classes:
+                raise ValueError("Bundle canonical class identities do not match runtime")
         for name, expected in manifest["file_sha256"].items():
             file_path = directory / name
             if not file_path.is_file() or sha256_path(file_path) != expected:
                 raise ValueError(f"Bundle hash mismatch: {name}")
         return cls(directory, manifest)
 
+    def load_models(
+        self,
+        *,
+        device: str = "cpu",
+        text_encoder: TextStreamEncoder | None = None,
+    ) -> CanonicalModelSet:
+        if text_encoder is None:
+            text_encoder = TextStreamEncoder.from_transformer(
+                str(self.manifest["encoder_model"]),
+                local_files_only=True,
+                device=device,
+            )
+            if text_encoder.revision != str(self.manifest["encoder_revision"]):
+                raise ValueError("Local TextEncoder revision does not match bundle")
+        if not isinstance(text_encoder, TextStreamEncoder):
+            raise TypeError("Runtime must use canonical TextStreamEncoder")
+        return CanonicalModelSet(
+            text_encoder=text_encoder,
+            text_score_head=load_text_mlp(self.path / "text_model.pt", device=device),
+            gat=load_gat(self.path / "graph_model.pt", device=device),
+            fusion=load_fusion_model(
+                self.path / "fusion_model.pt", device=device
+            )[0],
+            text_scaler=TrainOnlyScaler.load(self.path / "text_scaler.json"),
+            graph_scaler=TrainOnlyScaler.load(self.path / "graph_scaler.json"),
+        )
+
     def verify_prediction_probe(self, *, device: str = "cpu") -> dict[str, Any]:
         with np.load(self.path / "bundle_prediction_probe.npz", allow_pickle=False) as probe:
             text_features = np.asarray(probe["text_features"], dtype=np.float32)
-            text_logits, _, selected_text = selected_text_predictions(
+            text_logits, text_probability, selected_text = selected_text_predictions(
                 self.path, text_features, device=device
             )
             graph = GraphDataset(
@@ -473,18 +561,27 @@ class ModelBundle:
                 label_mask=np.ones((1, probe["graph_features"].shape[1]), dtype=bool),
                 decision_ids=np.full((1, probe["graph_features"].shape[1]), "probe"),
             )
-            graph_logits, _, _ = predict_gat(
-                load_gat(self.path / "graph_model.pt", device=device), graph, device=device
+            graph_logits, graph_probability, _, h_graph = predict_gat(
+                load_gat(self.path / "graph_model.pt", device=device),
+                graph,
+                device=device,
+                include_latent=True,
             )
             node = int(probe["node_index"])
             fusion_model, selected_fusion = load_fusion_model(
                 self.path / "fusion_model.pt", device=device
             )
             values = {
+                "h_text": np.asarray(probe["h_text"], dtype=np.float32),
+                "h_graph": h_graph[0, node][None].astype(np.float32),
                 "text_logit": np.asarray([text_logits[0]], dtype=np.float32),
                 "graph_logit": np.asarray([graph_logits[0, node]], dtype=np.float32),
-                "text_available": np.asarray([True]),
-                "graph_available": np.asarray([True]),
+                "text_probability": np.asarray(
+                    [float(probe["expected_text_probability"])], dtype=np.float32
+                ),
+                "graph_probability": np.asarray(
+                    [graph_probability[0, node]], dtype=np.float32
+                ),
             }
             fusion_logit = selected_fusion_logits(
                 fusion_model, selected_fusion, values, device=device
@@ -505,10 +602,31 @@ class ModelBundle:
                 "text_logit": bool(
                     np.isclose(text_logits[0], float(probe["expected_text_logit"]), atol=1e-6)
                 ),
+                "text_probability": bool(
+                    np.isclose(
+                        text_probability[0],
+                        float(probe["expected_text_probability"]),
+                        atol=1e-6,
+                    )
+                ),
                 "graph_logit": bool(
                     np.isclose(
                         graph_logits[0, node],
                         float(probe["expected_graph_logit"]),
+                        atol=1e-6,
+                    )
+                ),
+                "h_graph": bool(
+                    np.allclose(
+                        values["h_graph"],
+                        np.asarray(probe["expected_h_graph"], dtype=np.float32),
+                        atol=1e-6,
+                    )
+                ),
+                "graph_probability": bool(
+                    np.isclose(
+                        graph_probability[0, node],
+                        float(probe["expected_graph_probability"]),
                         atol=1e-6,
                     )
                 ),

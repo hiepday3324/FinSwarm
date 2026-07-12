@@ -171,3 +171,4 @@ tgi_scripts/data/
 /data/parquet
 /data/model_artifacts
 *.parquet
+*.md

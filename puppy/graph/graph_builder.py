@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import datetime as dt
 
+import numpy as np
+import torch
+
 from puppy.common.schemas import GraphOutput, QuantFeatureTable, ShadowPortfolioState, TextFeature
 from puppy.graph.correlation_graph import (
     build_attention_from_adjacency,
     build_correlation_adjacency,
 )
-from puppy.graph.gat_model import NumpyGATScorer
+from puppy.graph.gat_model import DenseSignedGAT, NumpyGATScorer
 from puppy.graph.graph_dataset import build_graph_sample
 from puppy.graph.graph_features import build_node_features
 
@@ -103,6 +106,75 @@ def build_gat_graph_output(
             "temporal_contract": "legacy_unverified",
             "score_range": "[-1, 1]",
             "feature_names": sample["metadata"]["feature_names"],
+        },
+    )
+
+
+def build_canonical_gat_output(
+    date: dt.date,
+    graph_sample: dict[str, object],
+    model: DenseSignedGAT,
+    *,
+    device: str = "cpu",
+) -> GraphOutput:
+    """Run the production GAT and adapt its structured tensors to GraphOutput."""
+
+    symbols = [str(value) for value in graph_sample["symbols"]]
+    feature_names = tuple(graph_sample["metadata"]["feature_names"])
+    features = torch.as_tensor(
+        np.asarray(graph_sample["feature_matrix"], dtype=np.float32)[None],
+        dtype=torch.float32,
+        device=device,
+    )
+    adjacency = torch.as_tensor(
+        np.asarray(graph_sample["adjacency_matrix"], dtype=np.float32)[None],
+        dtype=torch.float32,
+        device=device,
+    )
+    feature_mask = torch.as_tensor(
+        np.asarray(graph_sample["feature_mask"], dtype=bool)[None],
+        dtype=torch.bool,
+        device=device,
+    )
+    model.eval()
+    with torch.no_grad():
+        output = model(
+            features,
+            adjacency,
+            feature_mask,
+            symbols=symbols,
+            feature_names=feature_names,
+            feature_provenance=dict(graph_sample["metadata"]),
+        )
+    logits = output.logits[0].cpu().numpy()
+    probabilities = output.probabilities[0].cpu().numpy()
+    embeddings = output.h_graph[0].cpu().numpy()
+    alpha = output.alpha[0].cpu().numpy()
+    return GraphOutput(
+        date=date,
+        symbols=symbols,
+        node_features=dict(graph_sample["node_features"]),
+        adjacency=dict(graph_sample["adjacency"]),
+        graph_scores={
+            symbol: float(probability * 2.0 - 1.0)
+            for symbol, probability in zip(symbols, probabilities)
+        },
+        graph_logits={symbol: float(value) for symbol, value in zip(symbols, logits)},
+        graph_probabilities={
+            symbol: float(value) for symbol, value in zip(symbols, probabilities)
+        },
+        graph_embeddings={
+            symbol: value.astype(np.float32).tolist()
+            for symbol, value in zip(symbols, embeddings)
+        },
+        attention=_attention_dict(symbols, alpha),
+        feature_names=list(feature_names),
+        feature_provenance=dict(graph_sample["metadata"]),
+        metadata={
+            "method": "canonical_dense_signed_gat",
+            "uses_gat": True,
+            "production": True,
+            "h_graph_dim": int(embeddings.shape[-1]),
         },
     )
 

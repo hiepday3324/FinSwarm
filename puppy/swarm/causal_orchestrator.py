@@ -14,7 +14,12 @@ from puppy.common.schemas import (
     PendingDecision,
     ShadowPortfolioState,
     TextFeature,
+    FusionOutput,
+    GraphOutput,
 )
+from puppy.fusion.gated_fusion import build_latent_fusion_output
+from puppy.graph.graph_builder import build_canonical_gat_output
+from puppy.graph.graph_dataset import build_causal_graph_sample
 from puppy.swarm.context_builder import build_raw_context
 from puppy.training.rollout_state import canonical_json, stable_id
 from puppy.training.temporal_assertions import assert_context_causal, assert_shadow_prior
@@ -27,8 +32,16 @@ BOOTSTRAP_ENCODER_VERSION = "sha256-frozen-encoder-v1"
 class CausalDecisionBundle:
     context: AgentContext
     text_feature: TextFeature
+    text_score: float | None
     output: AgentOutput
     pending: PendingDecision
+
+
+@dataclass(frozen=True)
+class CanonicalStreamBundle:
+    graph_sample: dict[str, Any]
+    graph_output: GraphOutput
+    fusion_output: FusionOutput
 
 
 class DeterministicTextEncoder:
@@ -116,8 +129,15 @@ def build_context_hash(
 
 
 class CausalOrchestrator:
-    def __init__(self, encoder: DeterministicTextEncoder | None = None) -> None:
+    def __init__(
+        self,
+        encoder: Any | None = None,
+        text_score_head: Any | None = None,
+        text_scaler: Any | None = None,
+    ) -> None:
         self.encoder = encoder or DeterministicTextEncoder()
+        self.text_score_head = text_score_head
+        self.text_scaler = text_scaler
 
     def decide(
         self,
@@ -144,7 +164,11 @@ class CausalOrchestrator:
             long_memory=memories["long"],
             reflection_memory=memories["reflection"],
             memory_refs=refs,
-            shared_context=list(agent.external_context_buffer) if run_context.memory_sharing_enabled else [],
+            shared_context=(
+                list(agent.eligible_external_context(market_step.date))
+                if run_context.memory_sharing_enabled
+                else []
+            ),
             shadow_state=shadow_state.model_dump(mode="json") if shadow_state else None,
             psychology_state=psychology_state,
             as_of=run_context.current_cutoff,
@@ -170,12 +194,31 @@ class CausalOrchestrator:
             run_context.current_cutoff, context.context_hash, run_context.prompt_version,
             run_context.adapter_version,
         )
-        text_feature = self.encoder.encode(context, run_context, text_sample_id)
+        if isinstance(self.encoder, DeterministicTextEncoder):
+            text_feature = self.encoder.encode(context, run_context, text_sample_id)
+        else:
+            text_feature = self.encoder.encode(context)
+            text_feature.text_sample_id = text_sample_id
+            text_feature.as_of = run_context.current_cutoff
+            text_feature.context_hash = context.context_hash
+            text_feature.encoder_version = run_context.encoder_version
+            text_feature.prompt_version = run_context.prompt_version
         text_feature.decision_id = decision_id
+        text_score = None
+        if self.text_score_head is not None:
+            text_input = np.asarray([text_feature.h_text], dtype=np.float32)
+            if self.text_scaler is not None:
+                text_input = self.text_scaler.transform(text_input)
+            probability = self.text_score_head.predict_proba(text_input)
+            if hasattr(probability, "detach"):
+                probability = probability.detach().cpu().numpy()
+            text_score = float(np.asarray(probability).reshape(-1)[0])
+            text_feature.metadata["text_score"] = text_score
         output = agent.decide(market_step, context.model_copy(deep=True), run_context)
         output.decision_id = decision_id
         output.h_text = list(text_feature.h_text)
         output.raw_context = text_feature.raw_context
+        output.metadata["text_score"] = text_score
         context_snapshot = {
             "agent_context": context.model_dump(mode="json"),
             "price_bar": market_step.prices.get(agent.symbol).model_dump(mode="json") if agent.symbol in market_step.prices else None,
@@ -204,4 +247,84 @@ class CausalOrchestrator:
             status="pending" if expected_outcome_date else "unresolved_end_of_data",
             metadata={"split": split, "context_built_before_output": True},
         )
-        return CausalDecisionBundle(context, text_feature, output, pending)
+        return CausalDecisionBundle(context, text_feature, text_score, output, pending)
+
+    def run_canonical_streams(
+        self,
+        *,
+        bundles_by_symbol: dict[str, CausalDecisionBundle],
+        observed_table: Any,
+        shadow_states: dict[str, ShadowPortfolioState | None],
+        psychology_states: dict[str, dict[str, Any] | None],
+        gat_model: Any,
+        fusion_model: Any,
+        graph_scaler: Any | None = None,
+        return_history: dict[str, list[float]] | None = None,
+        return_source_dates: dict[str, list[Any]] | None = None,
+        device: str = "cpu",
+    ) -> CanonicalStreamBundle:
+        """Execute the one canonical model path after all contexts are frozen."""
+
+        symbols = list(observed_table.symbols)
+        missing = set(symbols) - set(bundles_by_symbol)
+        if missing:
+            raise ValueError(f"Missing decision bundle(s): {sorted(missing)}")
+        if any(bundles_by_symbol[symbol].text_score is None for symbol in symbols):
+            raise ValueError("Canonical runtime requires TextScoreHead before local action")
+        text_scores = {
+            symbol: float(bundles_by_symbol[symbol].text_score)
+            for symbol in symbols
+        }
+        action_signals = {
+            symbol: int(bundles_by_symbol[symbol].output.signal.action_signal)
+            for symbol in symbols
+        }
+        graph_sample = build_causal_graph_sample(
+            observed_table,
+            action_signals,
+            shadow_states,
+            {symbol: bundles_by_symbol[symbol].text_feature for symbol in symbols},
+            return_history,
+            return_source_dates,
+            text_scores=text_scores,
+            psychology_states=psychology_states,
+        )
+        model_sample = graph_sample
+        if graph_scaler is not None:
+            matrix = np.asarray(graph_sample["feature_matrix"], dtype=np.float32)
+            mask = np.asarray(graph_sample["feature_mask"], dtype=bool)
+            scaled = graph_scaler.transform(np.where(mask, matrix, np.nan))
+            model_sample = {
+                **graph_sample,
+                "feature_matrix": np.where(mask, scaled, 0.0).astype(np.float32),
+                "metadata": {
+                    **graph_sample["metadata"],
+                    "scaler": "bundle_graph_scaler",
+                },
+            }
+        graph_output = build_canonical_gat_output(
+            observed_table.date,
+            model_sample,
+            gat_model,
+            device=device,
+        )
+        h_text = np.asarray(
+            [bundles_by_symbol[symbol].text_feature.h_text for symbol in symbols],
+            dtype=np.float32,
+        )
+        h_graph = np.asarray(
+            [graph_output.graph_embeddings[symbol] for symbol in symbols],
+            dtype=np.float32,
+        )
+        fusion_output = build_latent_fusion_output(
+            observed_table.date,
+            symbols,
+            h_text,
+            h_graph,
+            text_scores,
+            graph_output.graph_probabilities,
+            fusion_model,
+            device=device,
+            metadata={"source": "CausalOrchestrator.run_canonical_streams"},
+        )
+        return CanonicalStreamBundle(graph_sample, graph_output, fusion_output)

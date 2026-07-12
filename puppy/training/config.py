@@ -17,9 +17,12 @@ def training_code_sha256(repo_root: str | Path) -> str:
     paths = sorted(
         list((root / "puppy" / "training").glob("*.py"))
         + [
-            root / "puppy" / "fusion" / "trainable_text_head.py",
-            root / "puppy" / "fusion" / "trainable_gated_fusion.py",
-            root / "puppy" / "graph" / "torch_gat_model.py",
+            root / "puppy" / "fusion" / "text_encoder.py",
+            root / "puppy" / "fusion" / "text_score_head.py",
+            root / "puppy" / "fusion" / "gated_fusion.py",
+            root / "puppy" / "graph" / "gat_model.py",
+            root / "puppy" / "graph" / "graph_features.py",
+            root / "puppy" / "graph" / "graph_dataset.py",
         ]
         + list((root / "scripts").glob("*finswarm*.py"))
         + list((root / "scripts").glob("*oof*.py"))
@@ -123,7 +126,7 @@ def _validate(config: TrainingConfig) -> None:
         (config.split, ("embargo_trading_days", "oof_folds", "oof_min_train_days")),
         (config.text_model, ("hidden_dim", "batch_size", "max_epochs", "patience")),
         (config.graph_model, ("hidden_dim", "num_heads", "batch_size", "max_epochs", "patience")),
-        (config.fusion_model, ("hidden_dim", "batch_size", "max_epochs", "patience")),
+        (config.fusion_model, ("latent_dim", "batch_size", "max_epochs", "patience")),
     ):
         for key in keys:
             if int(section[key]) <= 0:
