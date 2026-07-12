@@ -29,6 +29,22 @@ def compute_log_return(prev_price: float | int | None, next_price: float | int |
     return math.log(nxt / prev)
 
 
+def compute_next_open_to_close_return(
+    next_open: float | int | None,
+    next_close: float | int | None,
+) -> float | None:
+    """Return realized after executing at t+1 open and valuing at t+1 close."""
+    return compute_simple_return(next_open, next_close)
+
+
+def compute_legacy_close_to_close_return(
+    current_close: float | int | None,
+    next_close: float | int | None,
+) -> float | None:
+    """Compatibility helper for the pre-Stage 4 close-to-close target."""
+    return compute_simple_return(current_close, next_close)
+
+
 def build_direction_label(return_value: float | None, threshold: float = 0.0) -> int | None:
     if return_value is None:
         return None
@@ -71,8 +87,8 @@ def build_quant_feature_table(
     for symbol in symbols:
         current_bar = current_market_step.prices.get(symbol)
         next_bar = next_market_step.prices.get(symbol) if next_market_step else None
-        realized_return = compute_simple_return(
-            current_bar.close if current_bar else None,
+        realized_return = compute_next_open_to_close_return(
+            next_bar.open if next_bar else None,
             next_bar.close if next_bar else None,
         )
         returns[symbol] = realized_return
@@ -92,5 +108,5 @@ def build_quant_feature_table(
         returns=returns,
         labels=labels,
         features=features,
-        metadata={"label_return": "t+1_simple_return"},
+        metadata={"label_return": "t+1_open_to_close_return"},
     )

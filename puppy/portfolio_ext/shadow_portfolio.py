@@ -18,6 +18,8 @@ class ShadowPortfolio:
         self._values: dict[tuple[str, str], float] = {}
         self._equity_history: dict[tuple[str, str], list[float]] = {}
         self._return_history: dict[tuple[str, str], list[float]] = {}
+        self._states: dict[tuple[str, str], ShadowPortfolioState] = {}
+        self._resolved_counts: dict[tuple[str, str], int] = {}
 
     def update(
         self,
@@ -27,6 +29,29 @@ class ShadowPortfolio:
         realized_return: float | None,
         date: dt.date,
     ) -> ShadowPortfolioState:
+        return self.resolve_outcome(
+            agent_id=agent_id,
+            symbol=symbol,
+            action_signal=action_signal,
+            realized_return=realized_return,
+            decision_date=date,
+            outcome_date=date,
+            as_of=dt.datetime.combine(date, dt.time.max, dt.timezone.utc),
+        )
+
+    def resolve_outcome(
+        self,
+        *,
+        agent_id: str,
+        symbol: str,
+        action_signal: int,
+        realized_return: float | None,
+        decision_date: dt.date,
+        outcome_date: dt.date,
+        as_of: dt.datetime,
+    ) -> ShadowPortfolioState:
+        if outcome_date < decision_date:
+            raise ValueError("Outcome date cannot precede decision date")
         key = (agent_id, symbol)
         value_prev = self._values.get(key, self.initial_value)
         safe_return = 0.0 if realized_return is None else float(realized_return)
@@ -36,11 +61,12 @@ class ShadowPortfolio:
         self._values[key] = value_next
         self._equity_history.setdefault(key, []).append(value_next)
         self._return_history.setdefault(key, []).append(shadow_return)
+        self._resolved_counts[key] = self._resolved_counts.get(key, 0) + 1
 
         returns = self._return_history[key]
         curve = self._equity_history[key]
-        return ShadowPortfolioState(
-            date=date,
+        state = ShadowPortfolioState(
+            date=outcome_date,
             agent_id=agent_id,
             symbol=symbol,
             value=value_next,
@@ -49,6 +75,10 @@ class ShadowPortfolio:
             sharpe=compute_sharpe(returns),
             drawdown=compute_drawdown(curve),
             win_rate=compute_win_rate(returns),
+            as_of=as_of,
+            last_resolved_decision_date=decision_date,
+            last_outcome_date=outcome_date,
+            number_of_resolved_decisions=self._resolved_counts[key],
             metadata={
                 "action_signal": int(action_signal),
                 "realized_return": safe_return,
@@ -56,8 +86,17 @@ class ShadowPortfolio:
                 "previous_value": value_prev,
                 "value_next": value_next,
                 "initial_value": self.initial_value,
+                "last_resolved_decision_date": decision_date.isoformat(),
+                "last_outcome_date": outcome_date.isoformat(),
+                "as_of": as_of.isoformat(),
+                "number_of_resolved_decisions": self._resolved_counts[key],
             },
         )
+        self._states[key] = state
+        return state
+
+    def get_state(self, agent_id: str, symbol: str) -> ShadowPortfolioState | None:
+        return self._states.get((agent_id, symbol))
 
     def update_from_quant_table(
         self,

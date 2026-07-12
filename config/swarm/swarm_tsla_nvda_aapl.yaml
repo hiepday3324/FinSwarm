@@ -12,5 +12,5 @@ assets:
 paths:
   data_config: config/swarm/data_config.yaml
   model_config: config/swarm/model_config.yaml
-  experiment_config: config/swarm/experiment_config.yaml
+  experiment_config: config/swarm/experiment_v1.yaml
   price_split_manifest: data/manifests/price_split_manifest.json

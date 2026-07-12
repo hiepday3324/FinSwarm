@@ -57,7 +57,7 @@ def build_graph_output(
             "method": "correlation_graph_mvp",
             "score_range": "[-1, 1]",
             "uses_gat": False,
-            "uses_future_data": False,
+            "temporal_contract": "legacy_unverified",
         },
     )
 
@@ -100,7 +100,7 @@ def build_gat_graph_output(
             "method": "gat_mvp",
             "uses_gat": True,
             "implementation": "numpy_gat_mvp",
-            "uses_future_data": False,
+            "temporal_contract": "legacy_unverified",
             "score_range": "[-1, 1]",
             "feature_names": sample["metadata"]["feature_names"],
         },

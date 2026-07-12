@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+import warnings
 from typing import Any
 
 from puppy.common.enums import MemoryLayer
@@ -8,6 +9,12 @@ from puppy.common.schemas import (
     DebateRequest,
     MemoryRef,
     SharedContext,
+    AgentContext,
+    CausalRunContext,
+    MarketStep,
+    OutcomeTable,
+    PendingDecision,
+    ReflectionUpdate,
 )
 from puppy.run_type import RunMode
 
@@ -23,12 +30,46 @@ MEMORY_INDEX_FIELDS = {
 
 
 class SectorAgent:
-    def __init__(self, agent_id: str, symbol: str, llm_agent: Any):
+    def __init__(self, agent_id: str, symbol: str, llm_agent: Any, causal_adapter: Any | None = None):
         self.agent_id = agent_id
         self.symbol = symbol
         self.llm_agent = llm_agent
         self.external_context_buffer: list[SharedContext] = []
         self.outputs: dict[date, AgentOutput] = {}
+        self.causal_adapter = causal_adapter
+
+    def decide(
+        self,
+        market_step: MarketStep,
+        agent_context: AgentContext,
+        run_context: CausalRunContext,
+    ) -> AgentOutput:
+        if self.causal_adapter is None:
+            from .legacy_finmem_adapter import LegacyFinMemAdapter
+
+            self.causal_adapter = LegacyFinMemAdapter(
+                self.llm_agent,
+                self.agent_id,
+                self.symbol,
+                bootstrap=run_context.bootstrap,
+            )
+        output = self.causal_adapter.decide(market_step, agent_context, run_context)
+        self.outputs[run_context.current_date] = output
+        return output
+
+    def learn_from_outcome(
+        self,
+        pending_decision: PendingDecision,
+        realized_outcome: OutcomeTable | None,
+        run_context: CausalRunContext,
+    ) -> ReflectionUpdate:
+        if self.causal_adapter is None:
+            raise RuntimeError("Causal adapter must be initialized before learning")
+        return self.causal_adapter.learn_from_outcome(
+            pending_decision,
+            realized_outcome,
+            run_context,
+        )
 
     def inject_external_context(self, shared_context: SharedContext | str) -> None:
         if isinstance(shared_context, str):
@@ -61,6 +102,11 @@ class SectorAgent:
         self.external_context_buffer = active_context
 
     def step(self, market_info: tuple, run_mode: RunMode) -> AgentOutput:
+        warnings.warn(
+            "SectorAgent.step is a deprecated legacy FinMem path; use decide/learn_from_outcome",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         cur_date = market_info[0]
         self.clear_expired_external_context(cur_date)
         self.llm_agent.step(market_info=market_info, run_mode=run_mode)

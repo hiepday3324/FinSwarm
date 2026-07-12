@@ -5,7 +5,32 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from puppy.common.schemas import QuantFeatureTable, ShadowPortfolioState, TextFeature
+from puppy.common.schemas import ObservedFeatureTable, QuantFeatureTable, ShadowPortfolioState, TextFeature
+
+
+def build_causal_node_features(
+    observed_table: ObservedFeatureTable,
+    action_signals: dict[str, int],
+    shadow_states: dict[str, ShadowPortfolioState | None],
+    text_features: dict[str, TextFeature],
+) -> dict[str, dict[str, Any]]:
+    """Build production graph nodes from observed and prior-only state."""
+    result: dict[str, dict[str, Any]] = {}
+    for symbol in observed_table.symbols:
+        state = shadow_states.get(symbol)
+        text = text_features[symbol]
+        result[symbol] = {
+            "action_signal": int(action_signals.get(symbol, 0)),
+            **observed_table.features[symbol],
+            "shadow_roi_prior": state.roi if state else 0.0,
+            "shadow_rolling_return_prior": state.rolling_return if state else 0.0,
+            "shadow_drawdown_prior": state.drawdown if state else 0.0,
+            "shadow_sharpe_prior": state.sharpe if state else 0.0,
+            "shadow_win_rate_prior": state.win_rate if state else 0.0,
+            "text_norm": _l2_norm(text.h_text),
+            "num_text_features": len(text.h_text),
+        }
+    return result
 
 
 def build_node_features(

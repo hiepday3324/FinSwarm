@@ -6,6 +6,7 @@ from puppy.quant.return_utils import (
     build_direction_label,
     build_quant_feature_table,
     compute_log_return,
+    compute_next_open_to_close_return,
     compute_simple_return,
 )
 from puppy.quant.risk_rules import apply_basic_risk_rules
@@ -38,7 +39,7 @@ class QuantLayerTest(unittest.TestCase):
         nxt = MarketStep(
             date=next_date,
             symbols=["TSLA"],
-            prices={"TSLA": PriceBar(symbol="TSLA", date=next_date, close=105.0)},
+            prices={"TSLA": PriceBar(symbol="TSLA", date=next_date, open=100.0, close=105.0)},
             as_of=dt.datetime(2026, 1, 3, 23, 59, 59),
         )
         output = AgentOutput(
@@ -54,6 +55,7 @@ class QuantLayerTest(unittest.TestCase):
 
         self.assertAlmostEqual(compute_simple_return(100, 105), 0.05)
         self.assertAlmostEqual(compute_log_return(100, 105), 0.04879016416943205)
+        self.assertAlmostEqual(compute_next_open_to_close_return(100, 105), 0.05)
         self.assertEqual(build_direction_label(0.05), 1)
         table = build_quant_feature_table(date, ["TSLA"], [output], current, nxt)
         self.assertEqual(table.action_signals["TSLA"], 1)

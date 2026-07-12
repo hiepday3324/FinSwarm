@@ -26,6 +26,10 @@ class MemoryRef(SwarmBaseModel):
     score: float | None = None
     source_agent_id: str | None = None
     text_preview: str | None = None
+    source_event_id: str | None = None
+    source_type: str | None = None
+    available_at: dt.datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class SharedContext(SwarmBaseModel):
@@ -54,6 +58,9 @@ class AgentContext(SwarmBaseModel):
     shared_context: list[SharedContext] = Field(default_factory=list)
     shadow_state: dict[str, Any] | None = None
     psychology_state: dict[str, Any] | None = None
+    as_of: dt.datetime | None = None
+    context_hash: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TextFeature(SwarmBaseModel):
@@ -65,6 +72,13 @@ class TextFeature(SwarmBaseModel):
     embedding_model: str
     dim: int
     dtype: str = "float32"
+    text_sample_id: str | None = None
+    decision_id: str | None = None
+    as_of: dt.datetime | None = None
+    context_hash: str | None = None
+    encoder_version: str | None = None
+    prompt_version: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentSignal(SwarmBaseModel):
@@ -85,6 +99,12 @@ class AgentOutput(SwarmBaseModel):
     raw_context: str | None = None
     model_name: str | None = None
     parse_ok: bool = True
+    decision_id: str | None = None
+    context_hash: str | None = None
+    decision_cutoff: dt.datetime | None = None
+    prompt_version: str | None = None
+    adapter_version: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AllocationDecision(SwarmBaseModel):
@@ -162,6 +182,8 @@ class PriceBar(SwarmBaseModel):
     adj_close: float | None = None
     volume: float | int | None = None
     source: str | None = None
+    provider_record_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class NewsEvent(SwarmBaseModel):
@@ -173,6 +195,7 @@ class NewsEvent(SwarmBaseModel):
     text: str
     source: str | None = None
     url: str | None = None
+    provider_record_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -186,6 +209,8 @@ class FilingEvent(SwarmBaseModel):
     text: str
     source: str | None = None
     url: str | None = None
+    accession_number: str | None = None
+    provider_record_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -248,6 +273,99 @@ class ShadowPortfolioState(SwarmBaseModel):
     sharpe: float | None = None
     drawdown: float | None = None
     win_rate: float | None = None
+    as_of: dt.datetime | None = None
+    last_resolved_decision_date: dt.date | None = None
+    last_outcome_date: dt.date | None = None
+    number_of_resolved_decisions: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CausalRunContext(SwarmBaseModel):
+    run_id: str
+    config_path: str
+    current_date: dt.date
+    current_cutoff: dt.datetime
+    bootstrap: bool = False
+    prompt_version: str
+    encoder_version: str
+    adapter_version: str
+    git_commit: str
+    memory_sharing_enabled: bool = False
+    debate_enabled: bool = False
+    gat_enabled: bool = False
+    fusion_enabled: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ObservedFeatureTable(SwarmBaseModel):
+    date: dt.date
+    as_of: dt.datetime
+    symbols: list[str]
+    features: dict[str, dict[str, float | int | None]]
+    feature_names: list[str]
+    source_dates: dict[str, list[dt.date]] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PendingDecision(SwarmBaseModel):
+    decision_id: str
+    sample_id: str
+    run_id: str
+    agent_id: str
+    symbol: str
+    decision_date: dt.date
+    decision_cutoff: dt.datetime
+    expected_outcome_date: dt.date | None = None
+    decision: Decision | str
+    action_signal: int
+    reason: str
+    context_hash: str
+    context_snapshot: dict[str, Any]
+    memory_refs: list[MemoryRef] = Field(default_factory=list)
+    text_sample_id: str
+    graph_sample_id: str | None = None
+    prompt_version: str
+    encoder_version: str
+    adapter_version: str
+    status: str = "pending"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OutcomeTable(SwarmBaseModel):
+    outcome_id: str
+    decision_id: str
+    run_id: str
+    agent_id: str
+    symbol: str
+    decision_date: dt.date
+    outcome_date: dt.date
+    available_at: dt.datetime
+    open_price: float
+    close_price: float
+    asset_return: float
+    action_signal: int
+    strategy_return: float
+    direction_label: int
+    train_mask: bool
+    threshold_bps: int
+    formula_version: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReflectionUpdate(SwarmBaseModel):
+    reflection_id: str
+    decision_id: str
+    outcome_id: str
+    run_id: str
+    agent_id: str
+    symbol: str
+    source_decision_date: dt.date
+    outcome_date: dt.date
+    available_at: dt.datetime
+    text: str
+    memory_layer: str = "reflection"
+    prompt_version: str
+    context_hash: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

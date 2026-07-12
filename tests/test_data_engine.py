@@ -9,6 +9,9 @@ from puppy.data_engine.multi_asset_env import MultiAssetEnvironment
 from puppy.data_engine.parquet_loader import _stable_id
 
 
+UTC = dt.timezone.utc
+
+
 class DataEngineTest(unittest.TestCase):
     def setUp(self) -> None:
         self.store = DuckDBMarketStore(db_path=":memory:")
@@ -35,8 +38,8 @@ class DataEngineTest(unittest.TestCase):
                 {
                     "event_id": "news_1",
                     "symbol": "TSLA",
-                    "published_at": dt.datetime(2026, 1, 2, 10, 0, 0),
-                    "available_at": dt.datetime(2026, 1, 2, 10, 5, 0),
+                    "published_at": dt.datetime(2026, 1, 2, 10, 0, 0, tzinfo=UTC),
+                    "available_at": dt.datetime(2026, 1, 2, 10, 5, 0, tzinfo=UTC),
                     "title": "TSLA sales up",
                     "text": "Tesla delivery numbers exceeded forecasts.",
                     "source": "test",
@@ -52,8 +55,8 @@ class DataEngineTest(unittest.TestCase):
                     "symbol": "NVDA",
                     "filing_type": "10-Q",
                     "filing_date": dt.date(2026, 1, 2),
-                    "accepted_at": dt.datetime(2026, 1, 2, 16, 0, 0),
-                    "available_at": dt.datetime(2026, 1, 2, 16, 30, 0),
+                    "accepted_at": dt.datetime(2026, 1, 2, 16, 0, 0, tzinfo=UTC),
+                    "available_at": dt.datetime(2026, 1, 2, 16, 30, 0, tzinfo=UTC),
                     "text": "NVIDIA financial statements...",
                     "source": "test",
                     "url": None,
@@ -62,10 +65,8 @@ class DataEngineTest(unittest.TestCase):
             ]
         )
 
-        step = self.store.get_market_step(
-            date=dt.date(2026, 1, 2),
-            symbols=["TSLA", "NVDA"],
-            as_of=dt.datetime(2026, 1, 2, 23, 59, 59),
+        step = self.store.get_point_in_time_market_step(
+            dt.date(2026, 1, 2), ["TSLA", "NVDA"], [dt.date(2026, 1, 2)]
         )
         self.assertIsInstance(step, MarketStep)
         self.assertEqual(step.prices["TSLA"].close, 102.0)
@@ -74,7 +75,6 @@ class DataEngineTest(unittest.TestCase):
 
     def test_temporal_leakage_prevention_for_price_news_and_filing(self) -> None:
         t = dt.date(2026, 1, 2)
-        as_of = dt.datetime(2026, 1, 2, 12, 0, 0)
         self.store.ingest_prices(
             [
                 {"symbol": "TSLA", "date": dt.date(2026, 1, 1), "close": 99.0, "open": 99.0, "high": 99.0, "low": 99.0, "adj_close": 99.0, "volume": 100, "source": "test"},
@@ -84,18 +84,18 @@ class DataEngineTest(unittest.TestCase):
         )
         self.store.ingest_news(
             [
-                {"event_id": "news_past", "symbol": "TSLA", "published_at": dt.datetime(2026, 1, 2, 9, 0, 0), "available_at": dt.datetime(2026, 1, 2, 9, 5, 0), "text": "Safe news", "source": "test", "metadata": {}},
-                {"event_id": "news_future", "symbol": "TSLA", "published_at": dt.datetime(2026, 1, 2, 13, 0, 0), "available_at": dt.datetime(2026, 1, 2, 13, 5, 0), "text": "Future news", "source": "test", "metadata": {}},
+                {"event_id": "news_past", "symbol": "TSLA", "published_at": dt.datetime(2026, 1, 2, 9, 0, 0, tzinfo=UTC), "available_at": dt.datetime(2026, 1, 2, 9, 5, 0, tzinfo=UTC), "text": "Safe news", "source": "test", "metadata": {}},
+                {"event_id": "news_future", "symbol": "TSLA", "published_at": dt.datetime(2026, 1, 2, 22, 0, 0, tzinfo=UTC), "available_at": dt.datetime(2026, 1, 2, 22, 5, 0, tzinfo=UTC), "text": "Future news", "source": "test", "metadata": {}},
             ]
         )
         self.store.ingest_filings(
             [
-                {"filing_id": "filing_past", "symbol": "TSLA", "filing_type": "10-Q", "filing_date": t, "accepted_at": None, "available_at": dt.datetime(2026, 1, 2, 11, 0, 0), "text": "Safe filing", "source": "test", "metadata": {}},
-                {"filing_id": "filing_future", "symbol": "TSLA", "filing_type": "10-Q", "filing_date": t, "accepted_at": None, "available_at": dt.datetime(2026, 1, 2, 13, 0, 0), "text": "Future filing", "source": "test", "metadata": {}},
+                {"filing_id": "filing_past", "symbol": "TSLA", "filing_type": "10-Q", "filing_date": t, "accepted_at": dt.datetime(2026, 1, 2, 11, 0, 0, tzinfo=UTC), "available_at": dt.datetime(2026, 1, 2, 11, 0, 0, tzinfo=UTC), "text": "Safe filing", "source": "test", "metadata": {}},
+                {"filing_id": "filing_future", "symbol": "TSLA", "filing_type": "10-Q", "filing_date": t, "accepted_at": dt.datetime(2026, 1, 2, 22, 0, 0, tzinfo=UTC), "available_at": dt.datetime(2026, 1, 2, 22, 0, 0, tzinfo=UTC), "text": "Future filing", "source": "test", "metadata": {}},
             ]
         )
 
-        step = self.store.get_market_step(date=t, symbols=["TSLA"], as_of=as_of)
+        step = self.store.get_point_in_time_market_step(t, ["TSLA"], [t])
         self.assertEqual(step.prices["TSLA"].close, 100.0)
         self.assertEqual([item.event_id for item in step.news["TSLA"]], ["news_past"])
         self.assertEqual([item.filing_id for item in step.filings["TSLA"]], ["filing_past"])
@@ -154,7 +154,7 @@ class DataEngineTest(unittest.TestCase):
                 load_news_parquet(path)
 
     def test_news_loader_generates_deterministic_sha256_id(self) -> None:
-        from puppy.data_engine.parquet_loader import load_news_parquet
+        from puppy.data_engine.parquet_loader import load_news_parquet_legacy
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -170,8 +170,8 @@ class DataEngineTest(unittest.TestCase):
                 ]
             )
             pq.write_table(table, path)
-            first = load_news_parquet(path)
-            second = load_news_parquet(path)
+            first = load_news_parquet_legacy(path)
+            second = load_news_parquet_legacy(path)
             first_id = first.to_dict("records")[0]["event_id"]
             second_id = second.to_dict("records")[0]["event_id"]
             self.assertEqual(first_id, second_id)

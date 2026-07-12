@@ -166,3 +166,7 @@ awscliv2.zip
 weights/
 tgi_scripts/data/
 /data/raw
+/data/training
+/data/duckdb
+/data/parquet
+*.parquet

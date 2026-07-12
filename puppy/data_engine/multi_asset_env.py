@@ -25,6 +25,8 @@ class MultiAssetEnvironment:
         self.market_store.connect()
         if not self.symbols:
             return []
+        if hasattr(self.market_store, "list_common_dates"):
+            return list(self.market_store.list_common_dates(self.symbols))
         if hasattr(self.market_store, "list_dates"):
             return list(self.market_store.list_dates(self.symbols))
 
@@ -40,7 +42,10 @@ class MultiAssetEnvironment:
 
     def get_market_step(self, date: dt.date, as_of: dt.datetime | None = None) -> MarketStep:
         """Retrieve the market step for a specific date."""
-        return self.market_store.get_market_step(date, self.symbols, as_of=as_of)
+        step = self.market_store.get_point_in_time_market_step(date, self.symbols, self.dates)
+        if as_of is not None and step.as_of != as_of.astimezone(dt.timezone.utc):
+            raise ValueError("Production MarketStep.as_of is fixed by the decision cutoff.")
+        return step
 
     def step(self, date: dt.date | None = None, as_of: dt.datetime | None = None) -> MarketStep:
         """Advance the environment by one step or query a specific date."""
