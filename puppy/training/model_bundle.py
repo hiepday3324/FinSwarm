@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -12,7 +13,6 @@ import numpy as np
 import pyarrow.dataset as ds
 import torch
 
-from puppy.fusion.gated_fusion import LatentGatedFusion
 from puppy.fusion.text_encoder import TextStreamEncoder
 from puppy.fusion.text_score_head import TextScoreHead
 from puppy.graph.gat_model import DenseSignedGAT
@@ -20,6 +20,10 @@ from puppy.graph.gat_model import DenseSignedGAT
 from .checkpoint import TrainOnlyScaler, atomic_json
 from .config import TRAINING_CODE_VERSION, TrainingConfig, training_code_sha256
 from .fusion_trainer import (
+    CANONICAL_FUSION_SELECTION,
+    FusionModel,
+    GRAPH_ONLY_SELECTION,
+    SCALAR_FUSION_SELECTION,
     load_fusion_model,
     selected_fusion_logits,
 )
@@ -68,7 +72,7 @@ class CanonicalModelSet:
     text_encoder: TextStreamEncoder
     text_score_head: TextScoreHead
     gat: DenseSignedGAT
-    fusion: LatentGatedFusion
+    fusion: FusionModel
     text_scaler: TrainOnlyScaler
     graph_scaler: TrainOnlyScaler
 
@@ -119,6 +123,10 @@ def _metrics_and_audit(
     calibration = json.loads(
         (config.model_dir / "calibration.json").read_text(encoding="utf-8")
     )
+    feature_schema = json.loads(
+        (config.model_dir / "feature_schema.json").read_text(encoding="utf-8")
+    )
+    fusion_learnable = bool(fusion.get("learnable_module", True))
     metrics = {
         "text": {
             "selected_model": text["selected_text_model"],
@@ -186,10 +194,25 @@ def _metrics_and_audit(
         "oof_validation_access_zero": int(oof["validation_access_count"]) == 0,
         "oof_test_access_zero": int(oof["test_access_count"]) == 0,
         "fusion_oof_only": bool(fusion["oof_only_verified"]),
-        "fusion_parameters_changed": bool(fusion["parameter_changed"]),
-        "canonical_fusion_selected": fusion["selected_fusion_model"]
-        == "canonical_latent_fusion",
-        "oof_text_for_graph_verified": bool(oof["oof_text_for_graph_verified"]),
+        "fusion_parameter_contract_valid": (
+            bool(fusion.get("parameter_changed")) if fusion_learnable
+            else fusion.get("parameter_changed") is None
+        ),
+        "configured_fusion_selected": fusion["selected_fusion_model"]
+        == {
+            "latent_gate": CANONICAL_FUSION_SELECTION,
+            "scalar_logit_stack": SCALAR_FUSION_SELECTION,
+            "graph_only": GRAPH_ONLY_SELECTION,
+        }[config.fusion_head],
+        "graph_ablation_contract_matches": (
+            feature_schema.get("topology") == config.graph_topology
+            and feature_schema.get("include_text_score")
+            is config.graph_includes_text_score
+            and int(feature_schema.get("input_dim", -1))
+            == len(feature_schema.get("feature_names", []))
+        ),
+        "oof_graph_text_contract_matches": oof.get("graph_text_score_used")
+        is config.graph_includes_text_score,
         "oof_graph_latents_verified": bool(oof["oof_graph_latents_verified"]),
         "calibration_partition_only": calibration["partition"]
         == "validation_calibration",
@@ -198,8 +221,29 @@ def _metrics_and_audit(
         "test_feature_values_loaded": False,
         "real_causal_action_source": data_manifest.get("action_source")
         == "real_causal_sector_agent"
-        and not bool(data_manifest.get("bootstrap")),
-        "policy_dependent_graph_fields_used": True,
+        and not bool(data_manifest.get("bootstrap"))
+        and data_manifest.get("external_llm_used") is True
+        and data_manifest.get("final_training_eligible") is True
+        and data_manifest.get("full_interval") is True
+        and not bool(
+            (data_manifest.get("generation_provenance") or {}).get(
+                "synthetic", True
+            )
+        ),
+        "policy_dependent_graph_fields_used": all(
+            name in feature_schema.get("feature_names", [])
+            for name in (
+                "action_signal",
+                "shadow_roi_prior",
+                "shadow_rolling_return_prior",
+                "shadow_drawdown_prior",
+                "shadow_sharpe_prior",
+                "shadow_win_rate_prior",
+                "psychology_greed",
+                "psychology_fear",
+                "psychology_neutral",
+            )
+        ),
         "targets_in_graph_forward_inputs": False,
     }
     pass_checks = {
@@ -311,8 +355,10 @@ def _create_prediction_probe(
         dates=(date,),
         purpose="model_selection",
         guard=guard,
-        text_scores_by_decision=text_scores,
-        require_oof_text_scores=True,
+        text_scores_by_decision=(
+            text_scores if config.graph_includes_text_score else None
+        ),
+        require_oof_text_scores=config.graph_includes_text_score,
     )
     graph = scale_graph_dataset(graph_raw, graph_scaler)
     graph_logits, graph_probability, _, h_graph = predict_gat(
@@ -356,6 +402,7 @@ def _create_prediction_probe(
         graph_features=graph.features.astype(np.float32),
         graph_adjacency=graph.adjacency.astype(np.float32),
         graph_feature_mask=graph.feature_mask.astype(bool),
+        graph_feature_names=np.asarray(graph.feature_names),
         expected_h_graph=fusion_values["h_graph"],
         expected_text_logit=np.asarray(text_logits[text_index], dtype=np.float64),
         expected_text_probability=np.asarray(text_probability[text_index], dtype=np.float64),
@@ -373,6 +420,8 @@ def _create_prediction_probe(
         "symbol": symbol,
         "selected_text_model": selected_text,
         "selected_fusion_model": selected_fusion,
+        "graph_topology": config.graph_topology,
+        "graph_include_text_score": config.graph_includes_text_score,
     }
 
 
@@ -430,21 +479,52 @@ def build_model_bundle(
     fusion = json.loads(
         (config.model_dir / "fusion_training_history.json").read_text(encoding="utf-8")
     )
+    source_data_manifest = json.loads(
+        (config.model_dir / "source_data_manifest.json").read_text(encoding="utf-8")
+    )
+    graph_schema = json.loads(
+        (config.model_dir / "feature_schema.json").read_text(encoding="utf-8")
+    )
+    fusion_classes = {
+        CANONICAL_FUSION_SELECTION: "puppy.fusion.gated_fusion.LatentGatedFusion",
+        SCALAR_FUSION_SELECTION: "puppy.fusion.scalar_logit_stack.ScalarLogitStack",
+        GRAPH_ONLY_SELECTION: "puppy.fusion.scalar_logit_stack.GraphOnlyFusion",
+    }
+    model_classes = {
+        "text_encoder": "puppy.fusion.text_encoder.TextStreamEncoder",
+        "text_score_head": "puppy.fusion.text_score_head.TextScoreHead",
+        "gat": "puppy.graph.gat_model.DenseSignedGAT",
+        "fusion": fusion_classes[fusion["selected_fusion_model"]],
+    }
     manifest = {
-        "bundle_version": "finswarm-canonical-bundle-v2",
+        "bundle_version": (
+            "finswarm-canonical-bundle-v2"
+            if config.is_canonical_ablation_contract
+            else "finswarm-stage6-ablation-bundle-v1"
+        ),
         "training_code_version": TRAINING_CODE_VERSION,
         "training_code_sha256": training_code_sha256(config.repo_root),
+        "training_config_hash": config.config_hash,
         "git_commit": git_commit,
         "seed": config.seed,
         "pytorch_version": torch.__version__,
         "numpy_version": np.__version__,
         "encoder_model": embedding["encoder_model"],
         "encoder_revision": embedding["encoder_revision"],
-        "canonical_classes": {
-            "text_encoder": "puppy.fusion.text_encoder.TextStreamEncoder",
-            "text_score_head": "puppy.fusion.text_score_head.TextScoreHead",
-            "gat": "puppy.graph.gat_model.DenseSignedGAT",
-            "fusion": "puppy.fusion.gated_fusion.LatentGatedFusion",
+        "prompt_version": source_data_manifest.get("prompt_version"),
+        "action_source": source_data_manifest.get("action_source"),
+        "action_provenance": source_data_manifest.get("generation_provenance"),
+        "model_classes": model_classes,
+        "canonical_classes": (
+            model_classes if config.is_canonical_ablation_contract else None
+        ),
+        "ablation_contract": config.ablation_contract,
+        "ablation_fingerprint": config.ablation_fingerprint,
+        "graph_input": {
+            "topology": graph_schema["topology"],
+            "include_text_score": graph_schema["include_text_score"],
+            "input_dim": graph_schema["input_dim"],
+            "feature_names": graph_schema["feature_names"],
         },
         "input_artifact_hashes": {
             "data_manifest": files["source_data_manifest.json"],
@@ -488,13 +568,18 @@ class ModelBundle:
     def load(cls, path: str | Path) -> "ModelBundle":
         directory = Path(path)
         manifest = json.loads((directory / "bundle_manifest.json").read_text(encoding="utf-8"))
+        version = manifest.get("bundle_version")
         selected = manifest.get("selected_fusion_model")
-        if selected is not None and selected != "canonical_latent_fusion":
+        if (
+            version != "finswarm-stage6-ablation-bundle-v1"
+            and selected is not None
+            and selected != CANONICAL_FUSION_SELECTION
+        ):
             raise ValueError(
                 "Production model bundle must select canonical latent fusion; "
                 f"found {selected!r}"
             )
-        if manifest.get("bundle_version") == "finswarm-canonical-bundle-v2":
+        if version == "finswarm-canonical-bundle-v2":
             expected_classes = {
                 "text_encoder": "puppy.fusion.text_encoder.TextStreamEncoder",
                 "text_score_head": "puppy.fusion.text_score_head.TextScoreHead",
@@ -503,6 +588,75 @@ class ModelBundle:
             }
             if manifest.get("canonical_classes") != expected_classes:
                 raise ValueError("Bundle canonical class identities do not match runtime")
+        elif version == "finswarm-stage6-ablation-bundle-v1":
+            if selected not in {
+                CANONICAL_FUSION_SELECTION,
+                SCALAR_FUSION_SELECTION,
+                GRAPH_ONLY_SELECTION,
+            }:
+                raise ValueError(f"Unsupported ablation fusion selection: {selected!r}")
+            contract = manifest.get("ablation_contract")
+            if not isinstance(contract, dict):
+                raise ValueError("Ablation bundle is missing its strict contract")
+            if set(contract) != {"graph", "fusion", "oof"}:
+                raise ValueError("Ablation bundle has an unknown contract section")
+            graph_contract = contract.get("graph")
+            fusion_contract = contract.get("fusion")
+            oof_contract = contract.get("oof")
+            if (
+                not isinstance(graph_contract, dict)
+                or set(graph_contract) != {"topology", "include_text_score"}
+                or graph_contract.get("topology") not in {"full", "identity"}
+                or type(graph_contract.get("include_text_score")) is not bool
+                or not isinstance(fusion_contract, dict)
+                or set(fusion_contract) != {"head"}
+                or fusion_contract.get("head")
+                not in {"latent_gate", "scalar_logit_stack", "graph_only"}
+                or not isinstance(oof_contract, dict)
+                or set(oof_contract) != {"training_policy"}
+                or oof_contract.get("training_policy")
+                not in {"fixed_epochs", "inner_chronological_early_stop"}
+            ):
+                raise ValueError("Ablation bundle contract is unsupported")
+            expected_selection = {
+                "latent_gate": CANONICAL_FUSION_SELECTION,
+                "scalar_logit_stack": SCALAR_FUSION_SELECTION,
+                "graph_only": GRAPH_ONLY_SELECTION,
+            }[fusion_contract["head"]]
+            if selected != expected_selection:
+                raise ValueError("Ablation bundle Fusion head does not match selection")
+            encoded = json.dumps(
+                contract, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            if hashlib.sha256(encoded).hexdigest() != manifest.get(
+                "ablation_fingerprint"
+            ):
+                raise ValueError("Ablation bundle fingerprint mismatch")
+            graph_input = manifest.get("graph_input") or {}
+            if int(graph_input.get("input_dim", -1)) != len(
+                graph_input.get("feature_names", [])
+            ):
+                raise ValueError("Ablation bundle Graph input schema is inconsistent")
+            if (
+                graph_input.get("topology") != graph_contract["topology"]
+                or graph_input.get("include_text_score")
+                is not graph_contract["include_text_score"]
+                or ("text_score" in graph_input.get("feature_names", []))
+                is not graph_contract["include_text_score"]
+            ):
+                raise ValueError("Ablation bundle Graph input does not match contract")
+            expected_classes = {
+                "text_encoder": "puppy.fusion.text_encoder.TextStreamEncoder",
+                "text_score_head": "puppy.fusion.text_score_head.TextScoreHead",
+                "gat": "puppy.graph.gat_model.DenseSignedGAT",
+                "fusion": {
+                    CANONICAL_FUSION_SELECTION: "puppy.fusion.gated_fusion.LatentGatedFusion",
+                    SCALAR_FUSION_SELECTION: "puppy.fusion.scalar_logit_stack.ScalarLogitStack",
+                    GRAPH_ONLY_SELECTION: "puppy.fusion.scalar_logit_stack.GraphOnlyFusion",
+                }[selected],
+            }
+            if manifest.get("model_classes") != expected_classes:
+                raise ValueError("Ablation bundle model classes do not match runtime")
         for name, expected in manifest["file_sha256"].items():
             file_path = directory / name
             if not file_path.is_file() or sha256_path(file_path) != expected:
@@ -560,6 +714,7 @@ class ModelBundle:
                 targets=np.zeros((1, probe["graph_features"].shape[1]), dtype=np.float32),
                 label_mask=np.ones((1, probe["graph_features"].shape[1]), dtype=bool),
                 decision_ids=np.full((1, probe["graph_features"].shape[1]), "probe"),
+                feature_names=tuple(str(value) for value in probe["graph_feature_names"]),
             )
             graph_logits, graph_probability, _, h_graph = predict_gat(
                 load_gat(self.path / "graph_model.pt", device=device),

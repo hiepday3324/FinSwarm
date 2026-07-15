@@ -24,7 +24,6 @@ from .checkpoint import (
 )
 from .config import TrainingConfig
 from .graph_dataset_loader import (
-    GRAPH_FEATURE_NAMES,
     GraphDataset,
     graph_feature_schema,
     load_graph_dataset,
@@ -146,6 +145,31 @@ def _masked_metrics(dataset: GraphDataset, probabilities: np.ndarray) -> dict[st
     )
     result["masked_neutral_count"] = int(np.size(dataset.label_mask) - dataset.label_mask.sum())
     return result
+
+
+def _validated_oof_text_scores(
+    rows: list[dict[str, Any]],
+    *,
+    embargo_days: int,
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for row in rows:
+        decision_id = str(row["decision_id"])
+        if decision_id in scores:
+            raise ValueError(f"Duplicate Text OOF decision ID: {decision_id}")
+        if not bool(row.get("is_oof")) or not bool(
+            row.get("text_prediction_is_oof")
+        ):
+            raise ValueError(f"Graph training received a non-OOF Text score: {decision_id}")
+        if not row["text_model_train_end"] < row["decision_date"]:
+            raise ValueError(f"Graph training received an in-sample Text score: {decision_id}")
+        if int(row["embargo_trading_days"]) != embargo_days:
+            raise ValueError(f"Graph training received an OOF embargo mismatch: {decision_id}")
+        score = float(row["text_probability"])
+        if not 0.0 <= score <= 1.0:
+            raise ValueError(f"Graph training received an invalid Text score: {decision_id}")
+        scores[decision_id] = score
+    return scores
 
 
 def fit_gat(
@@ -271,39 +295,44 @@ def train_graph_stream(
     seed = config.seed if seed is None else int(seed)
     guard.assert_allowed("train", "scaler_fit")
     guard.assert_allowed("validation_selection", "early_stopping")
-    oof_path = config.model_dir / "oof_predictions.parquet"
-    if not oof_path.is_file():
-        raise FileNotFoundError(
-            "Canonical GAT training requires Text OOF predictions; run the oof stage first"
-        )
-    oof_rows = pq.read_table(oof_path).to_pylist()
-    text_scores = {
-        str(row["decision_id"]): float(row["text_probability"])
-        for row in oof_rows
-        if bool(row.get("text_prediction_is_oof"))
-    }
-    validation_text = load_supervised_text_dataset(
-        config,
-        splits,
-        guard=guard,
-        allowed_splits=("validation",),
-        allowed_dates=splits.validation_selection,
-        purpose="model_selection",
-    )
-    text_scaler = TrainOnlyScaler.load(config.model_dir / "text_scaler.json")
-    _, validation_text_probability, _ = selected_text_predictions(
-        config.model_dir,
-        text_scaler.transform(validation_text.embeddings),
-        device=device,
-    )
-    text_scores.update(
-        {
-            str(decision_id): float(probability)
-            for decision_id, probability in zip(
-                validation_text.decision_ids, validation_text_probability
+    include_text_score = config.graph_includes_text_score
+    oof_text_scores: dict[str, float] = {}
+    text_scores: dict[str, float] | None = None
+    if include_text_score:
+        oof_path = config.model_dir / "oof_predictions.parquet"
+        if not oof_path.is_file():
+            raise FileNotFoundError(
+                "Text-enabled GAT training requires Text OOF predictions; "
+                "run the oof stage first"
             )
-        }
-    )
+        oof_rows = pq.read_table(oof_path).to_pylist()
+        oof_text_scores = _validated_oof_text_scores(
+            oof_rows,
+            embargo_days=int(config.split["embargo_trading_days"]),
+        )
+        text_scores = dict(oof_text_scores)
+        validation_text = load_supervised_text_dataset(
+            config,
+            splits,
+            guard=guard,
+            allowed_splits=("validation",),
+            allowed_dates=splits.validation_selection,
+            purpose="model_selection",
+        )
+        text_scaler = TrainOnlyScaler.load(config.model_dir / "text_scaler.json")
+        _, validation_text_probability, _ = selected_text_predictions(
+            config.model_dir,
+            text_scaler.transform(validation_text.embeddings),
+            device=device,
+        )
+        text_scores.update(
+            {
+                str(decision_id): float(probability)
+                for decision_id, probability in zip(
+                    validation_text.decision_ids, validation_text_probability
+                )
+            }
+        )
     dataset = load_graph_dataset(
         config,
         splits,
@@ -311,18 +340,27 @@ def train_graph_stream(
         guard=guard,
         text_scores_by_decision=text_scores,
     )
-    text_index = dataset.feature_names.index("text_score")
-    covered_train_dates = tuple(
-        date
-        for day, date in enumerate(dataset.dates)
-        if date in set(splits.train_effective)
-        and bool(dataset.label_mask[day].any())
-        and bool(
-            dataset.feature_mask[day, :, text_index][dataset.label_mask[day]].all()
+    full_train = dataset.subset(splits.train_effective)
+    eligible_supervised_rows = full_train.supervised_count
+    if include_text_score:
+        text_index = dataset.feature_names.index("text_score")
+        covered_train_dates = tuple(
+            date
+            for day, date in enumerate(dataset.dates)
+            if date in set(splits.train_effective)
+            and bool(dataset.label_mask[day].any())
+            and all(
+                str(decision_id) in oof_text_scores
+                for decision_id in dataset.decision_ids[day][dataset.label_mask[day]]
+            )
+            and bool(
+                dataset.feature_mask[day, :, text_index][dataset.label_mask[day]].all()
+            )
         )
-    )
-    if not covered_train_dates:
-        raise ValueError("No effective-train graph rows have OOF Text scores")
+        if not covered_train_dates:
+            raise ValueError("No effective-train graph rows have OOF Text scores")
+    else:
+        covered_train_dates = splits.train_effective
     train_raw = dataset.subset(covered_train_dates)
     selection_raw = dataset.subset(splits.validation_selection)
     if not len(train_raw) or not len(selection_raw):
@@ -336,7 +374,7 @@ def train_graph_stream(
     model_dir = config.model_dir
     model_dir.mkdir(parents=True, exist_ok=True)
     scaler.save(model_dir / "graph_scaler.json")
-    atomic_json(model_dir / "feature_schema.json", graph_feature_schema())
+    atomic_json(model_dir / "feature_schema.json", graph_feature_schema(config))
 
     model, training = fit_gat(
         train,
@@ -358,7 +396,9 @@ def train_graph_stream(
         "model_type": "dense_signed_gat",
         "architecture": model.architecture_config(),
         "state_dict": model.state_dict(),
-        "feature_names": list(GRAPH_FEATURE_NAMES),
+        "feature_names": list(train.feature_names),
+        "topology": config.graph_topology,
+        "include_text_score": include_text_score,
         "symbols": list(dataset.symbols),
         "seed": seed,
         "best_epoch": training["best_epoch"],
@@ -408,7 +448,9 @@ def train_graph_stream(
     history = {
         **training,
         "architecture": model.architecture_config(),
-        "feature_names": list(GRAPH_FEATURE_NAMES),
+        "feature_names": list(train.feature_names),
+        "topology": config.graph_topology,
+        "include_text_score": include_text_score,
         "train_range": [min(train.dates).isoformat(), max(train.dates).isoformat()],
         "validation_selection_range": [
             min(selection.dates).isoformat(),
@@ -417,9 +459,22 @@ def train_graph_stream(
         "train_days": len(train),
         "train_manifest_effective_days": len(splits.train_effective),
         "oof_text_covered_train_days": len(covered_train_dates),
-        "text_score_source": "oof_by_decision_id_for_train",
+        "text_score_source": (
+            "oof_by_decision_id_for_train" if include_text_score else "disabled"
+        ),
         "validation_selection_days": len(selection),
         "train_supervised_rows": train.supervised_count,
+        "eligible_train_supervised_rows": eligible_supervised_rows,
+        "excluded_train_supervised_rows": (
+            eligible_supervised_rows - train.supervised_count
+        ),
+        "supervised_row_coverage_explanation": (
+            "All eligible effective-train rows are used because Graph has no "
+            "Text-score dependency."
+            if not include_text_score
+            else "Rows without strictly prior expanding-window Text OOF scores "
+            "are excluded from Graph fitting."
+        ),
         "validation_selection_supervised_rows": selection.supervised_count,
         "train_metrics": train_metrics,
         "validation_selection_metrics": selection_metrics,

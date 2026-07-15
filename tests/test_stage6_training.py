@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import inspect
 import json
 import tempfile
 import unittest
+import warnings
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
@@ -14,6 +18,7 @@ import pyarrow.parquet as pq
 import torch
 
 from puppy.fusion.gated_fusion import LatentGatedFusion
+from puppy.fusion.scalar_logit_stack import GraphOnlyFusion, ScalarLogitStack
 from puppy.fusion.text_score_head import TextScoreHead
 from puppy.graph.gat_model import DenseSignedGAT, NumpyGATScorer
 from puppy.training.calibration import fit_temperature
@@ -23,18 +28,26 @@ from puppy.training.checkpoint import (
     seed_everything,
     state_dict_sha256,
 )
-from puppy.training.config import TrainingConfig
+from puppy.training.config import TrainingConfig, _validate
 from puppy.training.fusion_trainer import (
+    GRAPH_ONLY_SELECTION,
+    SCALAR_FUSION_SELECTION,
     _candidate_metrics,
     fit_fusion,
+    fit_scalar_logit_stack,
     load_fusion_model,
     predict_fusion,
+    selected_fusion_logits,
+    train_fusion,
     validate_oof_rows,
 )
 from puppy.training.graph_dataset_loader import (
     GRAPH_FEATURE_NAMES,
     POLICY_DEPENDENT_GRAPH_FIELDS,
     GraphDataset,
+    configured_graph_feature_names,
+    graph_feature_schema,
+    load_graph_dataset,
 )
 from puppy.training.graph_trainer import (
     fit_gat,
@@ -42,13 +55,24 @@ from puppy.training.graph_trainer import (
     load_gat,
     predict_gat,
     scale_graph_dataset,
+    train_graph_stream,
 )
 from puppy.training.metrics import binary_metrics
 from puppy.training.model_bundle import ModelBundle
-from puppy.training.oof import assert_oof_only_access
-from puppy.training.pipeline import verify_causal_inputs
-from puppy.training.split import EffectiveSplits, build_effective_splits, build_oof_folds
-from puppy.training.text_dataset import load_supervised_text_dataset
+from puppy.training.oof import (
+    _generate_text_oof,
+    assert_oof_only_access,
+    generate_validation_base_predictions,
+    minimum_history_coverage_table,
+)
+from puppy.training.pipeline import _can_resume, verify_causal_inputs
+from puppy.training.split import (
+    EffectiveSplits,
+    build_effective_splits,
+    build_inner_chronological_split,
+    build_oof_folds,
+)
+from puppy.training.text_dataset import TextDataset, load_supervised_text_dataset
 from puppy.training.text_embedding import (
     FrozenSemanticEncoder,
     canonical_memory_text,
@@ -94,9 +118,19 @@ def _config(root: Path) -> TrainingConfig:
             "oof_min_train_days": 60,
         },
         "labels": {},
-        "text_model": {},
-        "graph_model": {},
-        "fusion_model": {},
+        "graph": {"topology": "full", "include_text_score": True},
+        "fusion": {"head": "latent_gate"},
+        "oof": {"training_policy": "fixed_epochs"},
+        "text_model": {
+            "hidden_dim": 8, "batch_size": 4, "max_epochs": 5, "patience": 2,
+        },
+        "graph_model": {
+            "hidden_dim": 4, "num_heads": 2, "batch_size": 2,
+            "max_epochs": 4, "patience": 2,
+        },
+        "fusion_model": {
+            "latent_dim": 4, "batch_size": 4, "max_epochs": 5, "patience": 2,
+        },
         "calibration": {"method": "temperature"},
     }
     return TrainingConfig(
@@ -116,7 +150,84 @@ def _config(root: Path) -> TrainingConfig:
         fusion_model=raw["fusion_model"],
         calibration=raw["calibration"],
         raw=raw,
+        graph=raw["graph"],
+        fusion=raw["fusion"],
+        oof=raw["oof"],
     )
+
+
+class Stage6AblationConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.config = _config(Path(self.temporary.name))
+        (self.config.artifact_dir / "data_manifest.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        (self.config.artifact_dir / "temporal_quality.json").write_text(
+            '{"status":"PASS"}\n', encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_unknown_and_unsupported_ablation_values_fail_closed(self) -> None:
+        invalid = (
+            replace(
+                self.config,
+                graph={
+                    "topology": "full",
+                    "include_text_score": True,
+                    "ignored": True,
+                },
+            ),
+            replace(
+                self.config,
+                graph={"topology": "dense", "include_text_score": True},
+            ),
+            replace(self.config, fusion={"head": "average"}),
+            replace(self.config, oof={"training_policy": "random_kfold"}),
+            replace(
+                self.config,
+                graph={"topology": "full", "include_text_score": 1},
+            ),
+        )
+        for config in invalid:
+            with self.subTest(contract=config.ablation_contract), self.assertRaises(
+                ValueError
+            ):
+                _validate(config)
+
+    def test_every_ablation_has_a_distinct_fingerprint_and_output(self) -> None:
+        root = self.config.repo_root / "data" / "model_artifacts" / "ablations"
+        contracts = (
+            ({"topology": "identity", "include_text_score": False}, {"head": "graph_only"}),
+            ({"topology": "full", "include_text_score": False}, {"head": "graph_only"}),
+            ({"topology": "full", "include_text_score": True}, {"head": "graph_only"}),
+            ({"topology": "full", "include_text_score": True}, {"head": "scalar_logit_stack"}),
+        )
+        configs = [
+            replace(
+                self.config,
+                graph=graph,
+                fusion=fusion,
+                model_dir=root / f"e{index}",
+            )
+            for index, (graph, fusion) in enumerate(contracts, start=1)
+        ]
+        self.assertEqual(len({item.ablation_fingerprint for item in configs}), 4)
+        self.assertEqual(len({item.model_dir for item in configs}), 4)
+        self.assertTrue(
+            all(item.model_dir != self.config.model_dir for item in configs)
+        )
+
+    def test_noncanonical_contract_cannot_target_canonical_directory(self) -> None:
+        with self.assertRaisesRegex(ValueError, "separate output.model_dir"):
+            _validate(
+                replace(
+                    self.config,
+                    graph={"topology": "identity", "include_text_score": False},
+                )
+            )
 
 
 class _FakeTokenizer:
@@ -338,6 +449,458 @@ class Stage6DatasetJoinTest(unittest.TestCase):
         self.assertNotIn("warmup", self.dataset.decision_ids)
 
 
+class Stage6GraphTextScoreAlignmentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.config = _config(Path(self.temporary.name))
+        self.date = dt.date(2025, 1, 5)
+        self.splits = EffectiveSplits(
+            warmup=(),
+            train_manifest=(),
+            train_effective=(),
+            embargoed_train=(),
+            validation_selection=(self.date,),
+            validation_calibration=(),
+            test_metadata_dates=(),
+        )
+        (self.config.artifact_dir / "feature_schema.json").write_text(
+            json.dumps({"graph_feature_names": list(GRAPH_FEATURE_NAMES)}),
+            encoding="utf-8",
+        )
+        outcomes = [
+            {
+                "decision_id": "supervised",
+                "decision_date": self.date,
+                "symbol": "TSLA",
+                "direction_label": 1,
+                "train_mask": True,
+                "supervised_eligible": True,
+                "cross_split_outcome": False,
+            },
+            {
+                "decision_id": "neutral",
+                "decision_date": self.date,
+                "symbol": "NVDA",
+                "direction_label": 0,
+                "train_mask": False,
+                "supervised_eligible": True,
+                "cross_split_outcome": False,
+            },
+            {
+                "decision_id": "cross-split",
+                "decision_date": self.date,
+                "symbol": "AAPL",
+                "direction_label": -1,
+                "train_mask": True,
+                "supervised_eligible": False,
+                "cross_split_outcome": True,
+            },
+        ]
+        pq.write_table(
+            pa.Table.from_pylist(outcomes),
+            self.config.artifact_dir / "outcomes.parquet",
+        )
+        text_index = GRAPH_FEATURE_NAMES.index("text_score")
+        features = np.zeros((3, len(GRAPH_FEATURE_NAMES)), dtype=np.float32)
+        features[:, text_index] = 0.5
+        feature_mask = np.ones_like(features, dtype=bool)
+        feature_mask[:, text_index] = False
+        self.adjacency = np.asarray(
+            [[1.0, 0.4, -0.2], [0.4, 1.0, 0.3], [-0.2, 0.3, 1.0]],
+            dtype=np.float32,
+        )
+        shard_dir = self.config.artifact_dir / "state" / "graph_shards"
+        shard_dir.mkdir(parents=True)
+        np.savez_compressed(
+            shard_dir / f"{self.date.isoformat()}.npz",
+            sample_id=np.asarray("graph-date"),
+            decision_date=np.asarray(self.date.isoformat()),
+            symbols=np.asarray(["TSLA", "NVDA", "AAPL"]),
+            feature_matrix=features,
+            adjacency_matrix=self.adjacency,
+            feature_mask=feature_mask,
+            max_source_date=np.asarray(self.date.isoformat()),
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _load(self, scores: dict[str, float] | None) -> GraphDataset:
+        return load_graph_dataset(
+            self.config,
+            self.splits,
+            dates=(self.date,),
+            purpose="model_selection",
+            text_scores_by_decision=scores,
+            require_oof_text_scores=True,
+        )
+
+    def _load_configured(
+        self,
+        config: TrainingConfig,
+        scores: dict[str, float] | None = None,
+    ) -> GraphDataset:
+        return load_graph_dataset(
+            config,
+            self.splits,
+            dates=(self.date,),
+            purpose="model_selection",
+            text_scores_by_decision=scores,
+            require_oof_text_scores=config.graph_includes_text_score,
+        )
+
+    def test_neutral_node_remains_masked_without_text_score(self) -> None:
+        dataset = self._load({"supervised": 0.8})
+        text_index = GRAPH_FEATURE_NAMES.index("text_score")
+        self.assertEqual(dataset.decision_ids[0, 1], "neutral")
+        self.assertFalse(dataset.label_mask[0, 1])
+        self.assertFalse(dataset.feature_mask[0, 1, text_index])
+        self.assertTrue(np.array_equal(dataset.adjacency[0], self.adjacency))
+
+    def test_cross_split_node_remains_masked_without_text_score(self) -> None:
+        dataset = self._load({"supervised": 0.8})
+        text_index = GRAPH_FEATURE_NAMES.index("text_score")
+        self.assertEqual(dataset.decision_ids[0, 2], "cross-split")
+        self.assertFalse(dataset.label_mask[0, 2])
+        self.assertFalse(dataset.feature_mask[0, 2, text_index])
+        self.assertEqual(dataset.symbols, ("TSLA", "NVDA", "AAPL"))
+
+    def test_supervised_node_missing_text_score_still_raises(self) -> None:
+        for scores in ({}, None):
+            with self.subTest(scores=scores), self.assertRaisesRegex(
+                ValueError,
+                "Missing required text score override for supervised decision supervised",
+            ):
+                self._load(scores)
+
+    def test_identity_topology_preserves_node_target_and_feature_alignment(self) -> None:
+        scores = {"supervised": 0.8}
+        full = self._load_configured(self.config, scores)
+        identity = self._load_configured(
+            replace(
+                self.config,
+                graph={"topology": "identity", "include_text_score": True},
+                model_dir=self.config.model_dir.parent / "identity",
+            ),
+            scores,
+        )
+        self.assertTrue(np.array_equal(identity.decision_ids, full.decision_ids))
+        self.assertTrue(np.array_equal(identity.targets, full.targets))
+        self.assertTrue(np.array_equal(identity.label_mask, full.label_mask))
+        self.assertTrue(np.array_equal(identity.features, full.features))
+        self.assertTrue(np.array_equal(identity.feature_mask, full.feature_mask))
+        self.assertTrue(np.array_equal(identity.adjacency[0], np.eye(3)))
+
+    def test_no_text_graph_removes_dependency_and_covers_every_eligible_row(self) -> None:
+        config = replace(
+            self.config,
+            graph={"topology": "full", "include_text_score": False},
+            model_dir=self.config.model_dir.parent / "no_text",
+        )
+        dataset = self._load_configured(config)
+        self.assertNotIn("text_score", dataset.feature_names)
+        self.assertEqual(
+            dataset.feature_names, configured_graph_feature_names(config)
+        )
+        self.assertEqual(dataset.features.shape[-1], len(GRAPH_FEATURE_NAMES) - 1)
+        schema = graph_feature_schema(config)
+        self.assertEqual(schema["input_dim"], dataset.features.shape[-1])
+        self.assertEqual(schema["feature_names"], list(dataset.feature_names))
+        self.assertFalse(schema["include_text_score"])
+        self.assertEqual(dataset.supervised_count, 1)
+        self.assertEqual(dataset.decision_ids[dataset.label_mask].tolist(), ["supervised"])
+        with self.assertRaisesRegex(ValueError, "forbids text-score overrides"):
+            self._load_configured(config, {"supervised": 0.8})
+
+    def test_missing_required_graph_feature_fails_closed(self) -> None:
+        missing = [name for name in GRAPH_FEATURE_NAMES if name != "action_signal"]
+        (self.config.artifact_dir / "feature_schema.json").write_text(
+            json.dumps({"graph_feature_names": missing}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "missing required features"):
+            self._load_configured(self.config, {"supervised": 0.8})
+
+
+class Stage6ValidationBaseAlignmentTest(unittest.TestCase):
+    def test_validation_base_emits_exact_supervised_id_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            first = dt.date(2025, 1, 1)
+            dates = tuple(first + dt.timedelta(days=index) for index in range(63))
+            splits = EffectiveSplits(
+                warmup=(),
+                train_manifest=(),
+                train_effective=(),
+                embargoed_train=(),
+                validation_selection=dates[:42],
+                validation_calibration=dates[42:],
+                test_metadata_dates=(first + dt.timedelta(days=100),),
+            )
+            symbols = ("TSLA", "NVDA", "AAPL")
+            graph_ids = np.asarray(
+                [[f"{date.isoformat()}-{symbol}" for symbol in symbols] for date in dates]
+            )
+            flattened = graph_ids.reshape(-1).tolist()
+            excluded = set(flattened[:9] + flattened[126:131])
+            eligible_ids = [decision_id for decision_id in flattened if decision_id not in excluded]
+            positions = {
+                graph_ids[day, node]: (date, symbol)
+                for day, date in enumerate(dates)
+                for node, symbol in enumerate(symbols)
+            }
+            text_data = TextDataset(
+                decision_ids=np.asarray(eligible_ids),
+                dates=np.asarray([positions[value][0] for value in eligible_ids], dtype=object),
+                symbols=np.asarray([positions[value][1] for value in eligible_ids]),
+                embeddings=np.zeros((175, 384), dtype=np.float32),
+                targets=np.asarray([index % 2 for index in range(175)], dtype=np.float32),
+                source_context_hashes=np.asarray([f"hash-{index}" for index in range(175)]),
+                metadata={
+                    "masked_neutral_count": 11,
+                    "cross_split_excluded_count": 3,
+                    "warmup_excluded_count": 0,
+                    "ineligible_count": 0,
+                    "missing_outcome_count": 0,
+                },
+            )
+            graph = GraphDataset(
+                sample_ids=np.asarray([f"graph-{date.isoformat()}" for date in dates]),
+                dates=np.asarray(dates, dtype=object),
+                symbols=symbols,
+                features=np.zeros((63, 3, len(GRAPH_FEATURE_NAMES)), dtype=np.float32),
+                adjacency=np.broadcast_to(np.eye(3, dtype=np.float32), (63, 3, 3)).copy(),
+                feature_mask=np.ones(
+                    (63, 3, len(GRAPH_FEATURE_NAMES)), dtype=bool
+                ),
+                targets=np.zeros((63, 3), dtype=np.float32),
+                label_mask=~np.isin(graph_ids, list(excluded)),
+                decision_ids=graph_ids,
+            )
+            scaler = mock.Mock()
+            scaler.transform.side_effect = lambda values: values
+            probabilities = np.linspace(0.1, 0.9, 175, dtype=np.float32)
+            logits = np.log(probabilities / (1.0 - probabilities)).astype(np.float32)
+            graph_logits = np.zeros((63, 3), dtype=np.float32)
+            graph_probabilities = np.full((63, 3), 0.5, dtype=np.float32)
+            alpha = np.broadcast_to(np.eye(3, dtype=np.float32), (63, 3, 3)).copy()
+            h_graph = np.zeros((63, 3, 4), dtype=np.float32)
+            guard = SplitAccessGuard()
+
+            def load_graph(*_args, **kwargs):
+                self.assertTrue(kwargs["require_oof_text_scores"])
+                self.assertEqual(
+                    set(kwargs["text_scores_by_decision"]), set(eligible_ids)
+                )
+                kwargs["guard"].assert_allowed(
+                    "validation_selection", kwargs["purpose"]
+                )
+                kwargs["guard"].assert_allowed(
+                    "validation_calibration", kwargs["purpose"]
+                )
+                return graph
+
+            with (
+                mock.patch(
+                    "puppy.training.oof.load_supervised_text_dataset",
+                    return_value=text_data,
+                ),
+                mock.patch("puppy.training.oof.TrainOnlyScaler.load", return_value=scaler),
+                mock.patch(
+                    "puppy.training.oof.selected_text_predictions",
+                    return_value=(logits, probabilities, "canonical_text_score_head"),
+                ),
+                mock.patch("puppy.training.oof.load_graph_dataset", side_effect=load_graph),
+                mock.patch("puppy.training.oof.scale_graph_dataset", return_value=graph),
+                mock.patch("puppy.training.oof.load_gat", return_value=mock.Mock()),
+                mock.patch(
+                    "puppy.training.oof.predict_gat",
+                    return_value=(
+                        graph_logits,
+                        graph_probabilities,
+                        alpha,
+                        h_graph,
+                    ),
+                ),
+            ):
+                summary = generate_validation_base_predictions(
+                    config, splits, guard=guard, device="cpu"
+                )
+
+            rows = pq.read_table(
+                config.model_dir / "validation_base_predictions.parquet"
+            ).to_pylist()
+            output_ids = [row["decision_id"] for row in rows]
+            self.assertEqual(len(rows), 175)
+            self.assertEqual(len(output_ids), len(set(output_ids)))
+            self.assertEqual(set(output_ids), set(eligible_ids))
+            self.assertTrue(
+                all(
+                    graph_ids[dates.index(row["decision_date"]), symbols.index(row["symbol"])]
+                    == row["decision_id"]
+                    for row in rows
+                )
+            )
+            self.assertEqual(summary["validation_selection_rows"], 117)
+            self.assertEqual(summary["validation_calibration_rows"], 58)
+            self.assertEqual(guard.test_feature_access_count, 0)
+
+
+class Stage6FusionBoundaryAndCheckpointTest(unittest.TestCase):
+    @staticmethod
+    def _fusion_row(decision_id: str, partition: str, target: int) -> dict[str, object]:
+        return {
+            "decision_id": decision_id,
+            "decision_date": dt.date(2025, 1, 2),
+            "symbol": "TSLA",
+            "partition": partition,
+            "h_text": [0.1, 0.2],
+            "h_graph": [0.3, 0.4],
+            "text_logit": 0.1,
+            "text_probability": 0.525,
+            "graph_logit": -0.1,
+            "graph_probability": 0.475,
+            "target": target,
+        }
+
+    def test_fusion_model_selection_excludes_calibration_labels(self) -> None:
+        class SelectionChecked(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            splits = EffectiveSplits(
+                warmup=(),
+                train_manifest=(),
+                train_effective=(dt.date(2024, 12, 1),),
+                embargoed_train=(),
+                validation_selection=(dt.date(2025, 1, 2),),
+                validation_calibration=(dt.date(2025, 1, 3),),
+                test_metadata_dates=(dt.date(2025, 1, 4),),
+            )
+            oof_rows = [
+                self._fusion_row("oof-negative", "train", 0),
+                self._fusion_row("oof-positive", "train", 1),
+            ]
+            validation_rows = [
+                self._fusion_row("selection-negative", "validation_selection", 0),
+                self._fusion_row("selection-positive", "validation_selection", 1),
+                self._fusion_row("calibration-sentinel", "validation_calibration", 99),
+            ]
+            pq.write_table(
+                pa.Table.from_pylist(oof_rows),
+                config.model_dir / "oof_predictions.parquet",
+            )
+            pq.write_table(
+                pa.Table.from_pylist(validation_rows),
+                config.model_dir / "validation_base_predictions.parquet",
+            )
+            guard = SplitAccessGuard()
+
+            def check_selection(_train, validation, *_args, **_kwargs):
+                self.assertEqual(validation["target"].tolist(), [0.0, 1.0])
+                raise SelectionChecked
+
+            with (
+                mock.patch(
+                    "puppy.training.fusion_trainer.generate_validation_base_predictions",
+                    return_value={"validation_selection_rows": 2},
+                ),
+                mock.patch("puppy.training.fusion_trainer.validate_oof_rows"),
+                mock.patch(
+                    "puppy.training.fusion_trainer.fit_fusion",
+                    side_effect=check_selection,
+                ),
+                self.assertRaises(SelectionChecked),
+            ):
+                train_fusion(config, splits, guard=guard, device="cpu")
+
+            self.assertEqual(guard.test_feature_access_count, 0)
+
+    def test_scalar_stack_selection_excludes_calibration_labels(self) -> None:
+        class SelectionChecked(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(_config(Path(directory)), fusion={"head": "scalar_logit_stack"})
+            splits = EffectiveSplits(
+                warmup=(),
+                train_manifest=(),
+                train_effective=(dt.date(2024, 12, 1),),
+                embargoed_train=(),
+                validation_selection=(dt.date(2025, 1, 2),),
+                validation_calibration=(dt.date(2025, 1, 3),),
+                test_metadata_dates=(dt.date(2025, 1, 4),),
+            )
+            oof_rows = [
+                self._fusion_row("oof-negative", "train", 0),
+                self._fusion_row("oof-positive", "train", 1),
+            ]
+            validation_rows = [
+                self._fusion_row("selection-negative", "validation_selection", 0),
+                self._fusion_row("selection-positive", "validation_selection", 1),
+                self._fusion_row("calibration-sentinel", "validation_calibration", 99),
+            ]
+            pq.write_table(
+                pa.Table.from_pylist(oof_rows),
+                config.model_dir / "oof_predictions.parquet",
+            )
+            pq.write_table(
+                pa.Table.from_pylist(validation_rows),
+                config.model_dir / "validation_base_predictions.parquet",
+            )
+
+            def check_selection(train, validation, *_args, **_kwargs):
+                self.assertNotIn("h_text", train)
+                self.assertNotIn("h_graph", train)
+                self.assertEqual(validation["target"].tolist(), [0.0, 1.0])
+                raise SelectionChecked
+
+            with (
+                mock.patch(
+                    "puppy.training.fusion_trainer.generate_validation_base_predictions",
+                    return_value={"validation_selection_rows": 2},
+                ),
+                mock.patch("puppy.training.fusion_trainer.validate_oof_rows"),
+                mock.patch(
+                    "puppy.training.fusion_trainer.fit_scalar_logit_stack",
+                    side_effect=check_selection,
+                ),
+                self.assertRaises(SelectionChecked),
+            ):
+                train_fusion(config, splits, guard=SplitAccessGuard(), device="cpu")
+
+    def test_incompatible_fusion_checkpoint_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            stale_output = config.model_dir / "validation_base_predictions.parquet"
+            stale_output.write_bytes(b"stale fusion output")
+            checkpoint = config.model_dir / ".stage_checkpoints" / "fusion.json"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        "fingerprint": {
+                            "stage": "fusion",
+                            "training_code_sha256": "old-code",
+                        },
+                        "output_hashes": {
+                            config.relative(stale_output): sha256_path(stale_output)
+                        },
+                        "result": {"status": "stale"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError, "Incompatible checkpoint for stage fusion"
+            ):
+                _can_resume(
+                    config,
+                    "fusion",
+                    {"stage": "fusion", "training_code_sha256": "new-code"},
+                )
+
+
 class Stage6SplitAndScalerTest(unittest.TestCase):
     def _manifest(self, path: Path) -> None:
         start = dt.date(2024, 1, 1)
@@ -556,6 +1119,60 @@ class Stage6GraphModelTest(unittest.TestCase):
         self.assertNotIn("target", inspect.signature(DenseSignedGAT.forward).parameters)
         self.assertNotIn("label", inspect.signature(DenseSignedGAT.forward).parameters)
 
+    def test_no_text_graph_trainer_uses_all_eligible_supervised_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            config = replace(
+                config,
+                graph={"topology": "full", "include_text_score": False},
+                graph_model=_graph_config(),
+                model_dir=config.model_dir.parent / "no_text_graph",
+            )
+            config.model_dir.mkdir(parents=True)
+            (config.artifact_dir / "data_manifest.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            source = _graph_dataset()
+            feature_names = configured_graph_feature_names(config)
+            graph = replace(
+                source,
+                features=np.zeros(
+                    (len(source), len(source.symbols), len(feature_names)),
+                    dtype=np.float32,
+                ),
+                feature_mask=np.ones(
+                    (len(source), len(source.symbols), len(feature_names)),
+                    dtype=bool,
+                ),
+                feature_names=feature_names,
+            )
+            splits = EffectiveSplits(
+                warmup=(),
+                train_manifest=tuple(graph.dates[:3]),
+                train_effective=tuple(graph.dates[:3]),
+                embargoed_train=(),
+                validation_selection=(graph.dates[3],),
+                validation_calibration=(),
+                test_metadata_dates=(),
+            )
+            with (
+                mock.patch(
+                    "puppy.training.graph_trainer.load_graph_dataset",
+                    return_value=graph,
+                ),
+                mock.patch(
+                    "puppy.training.graph_trainer.load_supervised_text_dataset",
+                    side_effect=AssertionError("No-text Graph must not load Text data"),
+                ),
+                warnings.catch_warnings(),
+            ):
+                warnings.simplefilter("ignore")
+                history = train_graph_stream(config, splits, device="cpu")
+            self.assertEqual(history["eligible_train_supervised_rows"], 9)
+            self.assertEqual(history["train_supervised_rows"], 9)
+            self.assertEqual(history["excluded_train_supervised_rows"], 0)
+            self.assertEqual(history["text_score_source"], "disabled")
+
 
 class Stage6OOFTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -585,6 +1202,102 @@ class Stage6OOFTest(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             validate_oof_rows([row], 20)
+
+    def test_inner_early_stop_split_is_chronological_and_embargoed(self) -> None:
+        history = self.folds[-1].train_dates
+        inner = build_inner_chronological_split(history, embargo_days=20)
+        self.assertEqual(len(inner.embargo_dates), 20)
+        self.assertLess(max(inner.train_dates), min(inner.validation_dates))
+        self.assertLess(max(inner.validation_dates), self.folds[-1].prediction_dates[0])
+        self.assertTrue(
+            set(inner.train_dates + inner.embargo_dates + inner.validation_dates)
+            == set(history)
+        )
+
+    def test_minimum_history_table_reports_coverage_without_applying_threshold(self) -> None:
+        records = [
+            {
+                "fold_id": fold,
+                "decision_date": dt.date(2025, 1, fold + 1),
+                "symbol": symbol,
+            }
+            for fold in (0, 1)
+            for symbol in ("TSLA", "NVDA", "AAPL")
+        ]
+        reports = [
+            {"fold_id": 0, "status": "complete", "graph_train_days": 30, "graph_train_rows": 90},
+            {"fold_id": 1, "status": "complete", "graph_train_days": 70, "graph_train_rows": 210},
+        ]
+        table = minimum_history_coverage_table(
+            records, reports, ("TSLA", "NVDA", "AAPL")
+        )
+        baseline = table[0]
+        self.assertEqual(baseline["folds_retained"], [0, 1])
+        self.assertEqual(baseline["fusion_rows_remaining"], 6)
+        threshold_40 = next(
+            row for row in table if row["minimum_graph_train_days"] == 40
+        )
+        self.assertEqual(threshold_40["folds_retained"], [1])
+        self.assertEqual(threshold_40["oof_supervised_rows_retained"], 3)
+
+    def test_inner_early_stop_never_uses_outer_prediction_rows(self) -> None:
+        fold = self.folds[0]
+        dates = fold.train_dates + fold.prediction_dates
+        text_data = TextDataset(
+            decision_ids=np.asarray([f"decision-{index}" for index in range(len(dates))]),
+            dates=np.asarray(dates, dtype=object),
+            symbols=np.asarray(["TSLA"] * len(dates)),
+            embeddings=np.zeros((len(dates), 384), dtype=np.float32),
+            targets=np.asarray([index % 2 for index in range(len(dates))], dtype=np.float32),
+            source_context_hashes=np.asarray([f"hash-{index}" for index in range(len(dates))]),
+            metadata={},
+        )
+        calls = []
+
+        def fake_fit(*args, **kwargs):
+            calls.append(
+                {
+                    "train_rows": len(args[0]),
+                    "validation_rows": len(args[2]),
+                    "fixed_epochs": kwargs.get("fixed_epochs"),
+                }
+            )
+            return object(), {"best_epoch": 3, "parameter_changed": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            with (
+                mock.patch("puppy.training.oof.fit_mlp", side_effect=fake_fit),
+                mock.patch(
+                    "puppy.training.oof.predict_mlp",
+                    side_effect=lambda _model, values, **_kwargs: (
+                        np.zeros(len(values), dtype=np.float32),
+                        np.full(len(values), 0.5, dtype=np.float32),
+                    ),
+                ),
+            ):
+                records, reports = _generate_text_oof(
+                    config,
+                    (fold,),
+                    text_data,
+                    seed=42,
+                    device="cpu",
+                    fixed_epochs=7,
+                    manifest_hash="manifest",
+                    training_policy="inner_chronological_early_stop",
+                    embargo_days=20,
+                )
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["fixed_epochs"])
+        self.assertEqual(calls[1]["fixed_epochs"], 3)
+        self.assertEqual(calls[1]["train_rows"], len(fold.train_dates))
+        self.assertEqual(calls[1]["validation_rows"], len(fold.train_dates))
+        self.assertEqual(len(records), len(fold.prediction_dates))
+        self.assertEqual(reports[0]["epochs"], 3)
+        self.assertLess(
+            dt.date.fromisoformat(reports[0]["inner"]["validation_end"]),
+            fold.prediction_dates[0],
+        )
 
 
 def _fusion_values() -> dict[str, np.ndarray]:
@@ -621,16 +1334,36 @@ class Stage6FusionCalibrationTest(unittest.TestCase):
     def test_fusion_accepts_valid_oof_rows(self) -> None:
         validate_oof_rows(
             [{
+                "decision_id": "valid-oof",
                 "is_oof": True,
                 "text_prediction_is_oof": True,
                 "graph_representation_is_oof": True,
                 "h_text": [0.1, 0.2],
                 "h_graph": [0.3, 0.4],
+                "text_logit": 0.1,
+                "graph_logit": -0.1,
                 "model_train_end": dt.date(2025, 1, 1),
                 "decision_date": dt.date(2025, 1, 22),
                 "embargo_trading_days": 20,
             }],
             20,
+        )
+
+    def test_scalar_stack_accepts_oof_logits_without_latent_vectors(self) -> None:
+        validate_oof_rows(
+            [{
+                "decision_id": "scalar-oof",
+                "is_oof": True,
+                "text_prediction_is_oof": True,
+                "graph_representation_is_oof": True,
+                "text_logit": 0.2,
+                "graph_logit": -0.3,
+                "model_train_end": dt.date(2025, 1, 1),
+                "decision_date": dt.date(2025, 1, 22),
+                "embargo_trading_days": 20,
+            }],
+            20,
+            require_latents=False,
         )
 
     def test_fusion_parameters_change_after_backward(self) -> None:
@@ -650,6 +1383,41 @@ class Stage6FusionCalibrationTest(unittest.TestCase):
             actual = predict_fusion(loaded, _fusion_values())[0]
         self.assertEqual(selected, "canonical_latent_fusion")
         self.assertTrue(np.allclose(expected, actual))
+
+    def test_scalar_stack_parameters_change_and_save_load_equivalence(self) -> None:
+        values = _fusion_values()
+        model, history = fit_scalar_logit_stack(
+            values, values, _fusion_config(), seed=42
+        )
+        self.assertTrue(history["parameter_changed"])
+        expected = selected_fusion_logits(model, SCALAR_FUSION_SELECTION, values)
+        manual = (
+            float(model.intercept.detach())
+            + float(model.weights[0].detach()) * values["text_logit"]
+            + float(model.weights[1].detach()) * values["graph_logit"]
+        )
+        self.assertTrue(np.allclose(expected, manual))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scalar.pt"
+            atomic_torch_save(
+                path,
+                {
+                    "architecture": model.architecture_config(),
+                    "state_dict": model.state_dict(),
+                    "selected_fusion_model": SCALAR_FUSION_SELECTION,
+                },
+            )
+            loaded, selected = load_fusion_model(path)
+            actual = selected_fusion_logits(loaded, selected, values)
+        self.assertEqual(selected, SCALAR_FUSION_SELECTION)
+        self.assertTrue(np.allclose(expected, actual))
+
+    def test_graph_only_head_is_exact_and_parameter_free(self) -> None:
+        values = _fusion_values()
+        model = GraphOnlyFusion()
+        logits = selected_fusion_logits(model, GRAPH_ONLY_SELECTION, values)
+        self.assertTrue(np.array_equal(logits, values["graph_logit"]))
+        self.assertEqual(sum(parameter.numel() for parameter in model.parameters()), 0)
 
     def test_scalar_only_inputs_are_rejected(self) -> None:
         model = LatentGatedFusion(text_dim=3, graph_dim=4, latent_dim=4, dropout=0).eval()
@@ -679,6 +1447,51 @@ class Stage6FusionCalibrationTest(unittest.TestCase):
 
 
 class Stage6BundleAndMetricsTest(unittest.TestCase):
+    @staticmethod
+    def _ablation_manifest() -> dict[str, object]:
+        contract = {
+            "graph": {"topology": "identity", "include_text_score": False},
+            "fusion": {"head": "graph_only"},
+            "oof": {"training_policy": "fixed_epochs"},
+        }
+        encoded = json.dumps(
+            contract, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return {
+            "bundle_version": "finswarm-stage6-ablation-bundle-v1",
+            "selected_fusion_model": "graph_only",
+            "ablation_contract": contract,
+            "ablation_fingerprint": hashlib.sha256(encoded).hexdigest(),
+            "graph_input": {
+                "topology": "identity",
+                "include_text_score": False,
+                "input_dim": 1,
+                "feature_names": ["action_signal"],
+            },
+            "model_classes": {
+                "text_encoder": "puppy.fusion.text_encoder.TextStreamEncoder",
+                "text_score_head": "puppy.fusion.text_score_head.TextScoreHead",
+                "gat": "puppy.graph.gat_model.DenseSignedGAT",
+                "fusion": "puppy.fusion.scalar_logit_stack.GraphOnlyFusion",
+            },
+            "file_sha256": {},
+        }
+
+    def test_ablation_bundle_requires_matching_contract_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._ablation_manifest()
+            (root / "bundle_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            self.assertEqual(ModelBundle.load(root).path, root)
+            manifest["ablation_fingerprint"] = "0" * 64
+            (root / "bundle_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
+                ModelBundle.load(root)
+
     def test_bundle_loader_verifies_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

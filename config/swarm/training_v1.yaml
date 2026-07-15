@@ -33,6 +33,16 @@ labels:
   mask_neutral: true
   threshold_bps: 10
 
+graph:
+  topology: full
+  include_text_score: true
+
+fusion:
+  head: latent_gate
+
+oof:
+  training_policy: fixed_epochs
+
 text_model:
   baseline: logistic_regression
   primary: mlp

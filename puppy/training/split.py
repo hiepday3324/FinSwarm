@@ -18,6 +18,13 @@ class OOFFold:
 
 
 @dataclass(frozen=True)
+class InnerChronologicalSplit:
+    train_dates: tuple[dt.date, ...]
+    embargo_dates: tuple[dt.date, ...]
+    validation_dates: tuple[dt.date, ...]
+
+
+@dataclass(frozen=True)
 class EffectiveSplits:
     warmup: tuple[dt.date, ...]
     train_manifest: tuple[dt.date, ...]
@@ -92,3 +99,31 @@ def build_oof_folds(
             raise AssertionError("Invalid OOF train/embargo construction")
         result.append(OOFFold(fold_id, fold_train, embargo, predictions))
     return result
+
+
+def build_inner_chronological_split(
+    history_dates: tuple[dt.date, ...],
+    *,
+    embargo_days: int,
+    validation_fraction: float = 0.2,
+) -> InnerChronologicalSplit:
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("Inner validation fraction must be between 0 and 1")
+    if tuple(sorted(set(history_dates))) != history_dates:
+        raise ValueError("Inner chronological history dates must be unique and sorted")
+    validation_count = max(1, int(math.floor(len(history_dates) * validation_fraction)))
+    validation_start = len(history_dates) - validation_count
+    train_end = validation_start - embargo_days
+    if train_end <= 0:
+        raise ValueError(
+            "Insufficient historical dates for inner chronological train, embargo, "
+            "and validation segments"
+        )
+    train = history_dates[:train_end]
+    embargo = history_dates[train_end:validation_start]
+    validation = history_dates[validation_start:]
+    if not train or len(embargo) != embargo_days or not validation:
+        raise AssertionError("Invalid inner chronological split")
+    if not max(train) < min(validation):
+        raise AssertionError("Inner chronological train must precede validation")
+    return InnerChronologicalSplit(train, embargo, validation)

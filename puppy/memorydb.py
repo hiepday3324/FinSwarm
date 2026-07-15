@@ -8,7 +8,7 @@ import numpy as np
 from datetime import date
 from itertools import repeat
 from sortedcontainers import SortedList
-from .embedding import OpenAILongerThanContextEmb
+from .embedding import build_memory_embedding
 from typing import List, Union, Dict, Any, Tuple, Callable
 from .memory_functions import (
     ImportanceScoreInitialization,
@@ -46,6 +46,7 @@ class MemoryDB:  # can possibly take multiple symbols
         clean_up_threshold_dict: Dict[
             str, float
         ],  # {"recency_threshold": x, "importance_threshold": y"}
+        embedding_backend: Any | None = None,
     ) -> None:
         # db attributes
         self.db_name = db_name
@@ -53,8 +54,11 @@ class MemoryDB:  # can possibly take multiple symbols
         self.jump_threshold_upper = jump_threshold_upper
         self.jump_threshold_lower = jump_threshold_lower
         self.emb_config = emb_config
-        self.emb_func = OpenAILongerThanContextEmb(**self.emb_config)
-        # self.emb_func = OpenAILongerThanContextEmb(**self.config["agent"]["agent_1"]["embedding"]["detail"])
+        self.emb_func = (
+            embedding_backend
+            if embedding_backend is not None
+            else build_memory_embedding(self.emb_config)
+        )
         self.emb_dim = self.emb_func.get_embedding_dimension()
         self.importance_score_initialization_func = importance_score_initialization
         self.recency_score_initialization_func = recency_score_initialization
@@ -485,33 +489,41 @@ class BrainDB:
         self.logger = logger
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "BrainDB":
+    def from_config(
+        cls,
+        config: Dict[str, Any],
+        *,
+        embedding_backend: Any | None = None,
+        logger: logging.Logger | None = None,
+    ) -> "BrainDB":
         # other states
         id_generator = id_generator_func()
         agent_name = config["general"]["agent_name"]
         # logger
-        logger = logging.getLogger(__name__)
+        logger = logger or logging.getLogger(__name__)
         logger.setLevel(logging.INFO)
-        logging_formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        file_handler = logging.FileHandler(
-            os.path.join(
-                "data",
-                "04_model_output_log",
-                f'{config["general"]["trading_symbol"]}_run.log',
-            ),
-            mode="a",
-        )
-        file_handler.setFormatter(logging_formatter)
-        logger.addHandler(file_handler)
+        if not logger.handlers:
+            logging_formatter = logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            file_handler = logging.FileHandler(
+                os.path.join(
+                    "data",
+                    "04_model_output_log",
+                    f'{config["general"]["trading_symbol"]}_run.log',
+                ),
+                mode="a",
+            )
+            file_handler.setFormatter(logging_formatter)
+            logger.addHandler(file_handler)
         emb_config = config["agent"]["agent_1"]["embedding"]["detail"]
         # memory layers
         short_term_memory = MemoryDB(
             db_name=f"{agent_name}_short",
             id_generator=id_generator,
             emb_config=emb_config,
+            embedding_backend=embedding_backend,
             jump_threshold_upper=config["short"]["jump_threshold_upper"],
             jump_threshold_lower=-999999999,  # no lower bound
             importance_score_initialization=get_importance_score_initialization_func(
@@ -533,6 +545,7 @@ class BrainDB:
             jump_threshold_upper=config["mid"]["jump_threshold_upper"],
             jump_threshold_lower=config["mid"]["jump_threshold_lower"],
             emb_config=emb_config,
+            embedding_backend=embedding_backend,
             importance_score_initialization=get_importance_score_initialization_func(
                 type=config["mid"]["importance_score_initialization"],
                 memory_layer="mid",
@@ -550,6 +563,7 @@ class BrainDB:
             jump_threshold_upper=999999999,  # no upper bound
             jump_threshold_lower=config["long"]["jump_threshold_lower"],
             emb_config=emb_config,
+            embedding_backend=embedding_backend,
             importance_score_initialization=get_importance_score_initialization_func(
                 type=config["long"]["importance_score_initialization"],
                 memory_layer="long",
@@ -569,6 +583,7 @@ class BrainDB:
             jump_threshold_upper=999999999,  # no upper bound
             jump_threshold_lower=-999999999,  # no lower bound
             emb_config=emb_config,
+            embedding_backend=embedding_backend,
             importance_score_initialization=get_importance_score_initialization_func(
                 type=config["reflection"]["importance_score_initialization"],
                 memory_layer="reflection",

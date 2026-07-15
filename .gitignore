@@ -172,3 +172,5 @@ tgi_scripts/data/
 /data/model_artifacts
 *.parquet
 *.md
+!docs/openai_causal_rollout_runbook.md
+*.md

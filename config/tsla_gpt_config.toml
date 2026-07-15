@@ -24,6 +24,7 @@ From year 2021 to 2022 September, Tesla's continued growth and solid financial p
 
 
 [agent.agent_1.embedding.detail]
+provider = "openai"
 embedding_model = "text-embedding-ada-002"
 chunk_size=5000
 verbose=false

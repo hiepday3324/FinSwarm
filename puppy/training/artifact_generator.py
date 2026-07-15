@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from puppy.agent import causal_eligible_memory_set_hash, causal_memory_inputs
 from puppy.common.schemas import (
     CausalRunContext,
     PendingDecision,
@@ -31,6 +32,12 @@ from puppy.swarm.psychology import build_psychology_state
 from puppy.swarm.sector_agent import SectorAgent
 
 from .dataset_exporter import export_artifact_tables, export_graph_npz
+from .decision_journal import (
+    CausalDecisionJournal,
+    CausalDecisionJournalError,
+    eligible_memory_set_hash,
+    runtime_decision_contract,
+)
 from .observed_features import FEATURE_DEFINITIONS, OBSERVED_FEATURE_NAMES, build_observed_feature_table
 from .outcome_resolver import resolve_outcome
 from .rollout_state import atomic_write_json, atomic_write_text, canonical_json, sha256_path, stable_id
@@ -47,6 +54,55 @@ from .temporal_assertions import (
 
 PROMPT_VERSION = "bootstrap-decision-v1"
 GENERATOR_VERSION = "stage5-canonical-causal-artifacts-v2"
+
+
+def _sanitized_provenance(value: dict[str, Any] | None) -> dict[str, Any]:
+    raw = dict(value or {})
+    backend_raw = raw.get("backend_config")
+    backend = dict(backend_raw) if isinstance(backend_raw, dict) else {}
+    safe_backend_fields = {
+        "provider",
+        "interface",
+        "base_url",
+        "model",
+        "timeout_seconds",
+        "max_retries",
+        "requests_per_minute",
+        "temperature",
+        "backend_identity",
+    }
+    return {
+        "mode": str(raw.get("mode", "unverified_nonbootstrap")),
+        "synthetic": bool(raw.get("synthetic", True)),
+        "external_llm_expected": bool(raw.get("external_llm_expected", False)),
+        "provider": str(raw.get("provider", "unknown")),
+        "model": str(raw.get("model", "unknown")),
+        "backend_identity": str(raw.get("backend_identity", "unknown")),
+        "backend_config": {
+            key: backend[key] for key in safe_backend_fields if key in backend
+        },
+    }
+
+
+def _aggregate_decision_quality(agents: dict[str, SectorAgent]) -> dict[str, int]:
+    fields = (
+        "total_decisions",
+        "buy_count",
+        "hold_count",
+        "sell_count",
+        "parse_success_count",
+        "retry_count",
+        "cache_hit_count",
+        "api_call_count",
+        "failed_decision_count",
+    )
+    return {
+        field: sum(
+            int(getattr(agent.causal_adapter, "decision_stats", {}).get(field, 0))
+            for agent in agents.values()
+        )
+        for field in fields
+    }
 
 
 def _git_commit(root: Path) -> str:
@@ -117,6 +173,7 @@ def _output_row(bundle: Any, run_id: str, split: str) -> dict[str, Any]:
         "action_signal": output.signal.action_signal,
         "reason": output.signal.reason,
         "parse_ok": output.parse_ok,
+        "model_name": output.model_name,
         "context_hash": output.context_hash,
         "prompt_version": output.prompt_version,
         "adapter_version": output.adapter_version,
@@ -162,6 +219,33 @@ def _atomic_graph_shard(path: Path, sample: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _load_resume_checkpoint(
+    path: Path,
+    *,
+    fingerprint: str,
+    symbols: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Resume checkpoint is unreadable") from exc
+    if not isinstance(value, dict):
+        raise ValueError("Resume checkpoint must be a JSON object")
+    if value.get("manifest_fingerprint") != fingerprint:
+        raise ValueError("Resume checkpoint fingerprint mismatch")
+    completed = value.get("completed_symbols_for_current_date", [])
+    if not isinstance(completed, list) or any(symbol not in symbols for symbol in completed):
+        raise ValueError("Resume checkpoint has invalid completed symbols")
+    if completed != list(symbols[: len(completed)]):
+        raise ValueError("Resume checkpoint symbol progress is not canonical")
+    next_symbol = value.get("next_symbol")
+    if next_symbol is not None and next_symbol not in symbols:
+        raise ValueError("Resume checkpoint has an invalid next symbol")
+    return value
+
+
 def generate_training_artifacts(
     config_path: str,
     *,
@@ -176,6 +260,7 @@ def generate_training_artifacts(
     encoder: Any | None = None,
     text_score_head: Any | None = None,
     prompt_version: str | None = None,
+    generation_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not bootstrap and causal_agents is None:
         raise RuntimeError(
@@ -187,6 +272,39 @@ def generate_training_artifacts(
             "Real causal artifact generation requires an injected canonical "
             "TextStreamEncoder; no fallback encoder was selected."
         )
+    provenance = (
+        {
+            "mode": "bootstrap",
+            "synthetic": False,
+            "external_llm_expected": False,
+            "provider": "none",
+            "model": "bootstrap-deterministic-policy-v1",
+            "backend_identity": "none",
+            "backend_config": {},
+        }
+        if bootstrap
+        else _sanitized_provenance(generation_provenance)
+    )
+    if not bootstrap and provenance["synthetic"] and output_root is None:
+        raise ValueError(
+            "Synthetic/mock causal rollout requires an explicit temporary output_root; "
+            "the canonical Stage 5 directory is protected"
+        )
+    if causal_agents is not None:
+        expected_symbols = set(load_stage4_config(config_path).symbols)
+        missing_agents = expected_symbols - set(causal_agents)
+        if missing_agents:
+            raise ValueError(f"Missing causal SectorAgent(s): {sorted(missing_agents)}")
+        bootstrap_adapters = [
+            symbol
+            for symbol, agent in causal_agents.items()
+            if bool(getattr(agent.causal_adapter, "bootstrap", False))
+        ]
+        if bootstrap_adapters:
+            raise ValueError(
+                "Real causal artifact generation received bootstrap adapter(s): "
+                f"{bootstrap_adapters}"
+            )
     config = load_stage4_config(config_path)
     splits, common_dates = _split_manifest(config.split_manifest)
     requested_start = dt.date.fromisoformat(start) if start else common_dates[0]
@@ -195,6 +313,9 @@ def generate_training_artifacts(
     if not decision_dates:
         raise ValueError("Requested interval contains no common trading dates")
     run_id = config.run_id
+    full_interval = (
+        requested_start == common_dates[0] and requested_end == common_dates[-1]
+    )
     root = Path(output_root) if output_root else config.repo_root / "data/training"
     output_dir = root / run_id
     feature_schema = {
@@ -230,11 +351,13 @@ def generate_training_artifacts(
             else f"transformers-frozen:{getattr(encoder, 'revision', 'configured')}"
         ),
         "adapter_version": ADAPTER_VERSION,
+        "generation_provenance": provenance,
         "bootstrap": bootstrap,
         "start": requested_start,
         "end": requested_end,
     }
     fingerprint = stable_id(fingerprint_payload)
+    resume_checkpoint: dict[str, Any] | None = None
     if output_dir.exists():
         if overwrite:
             shutil.rmtree(output_dir)
@@ -270,6 +393,28 @@ def generate_training_artifacts(
     state_dir = output_dir / "state"
     graph_shard_dir = state_dir / "graph_shards"
     graph_shard_dir.mkdir(parents=True, exist_ok=True)
+    if resume:
+        resume_checkpoint = _load_resume_checkpoint(
+            state_dir / "checkpoint.json",
+            fingerprint=fingerprint,
+            symbols=tuple(config.symbols),
+        )
+    decision_journal = (
+        None
+        if bootstrap
+        else CausalDecisionJournal(
+            state_dir,
+            rollout_fingerprint=fingerprint,
+            symbols=tuple(config.symbols),
+        )
+    )
+    if (
+        resume_checkpoint is not None
+        and decision_journal is not None
+        and "journal_record_count" in resume_checkpoint
+        and int(resume_checkpoint["journal_record_count"]) > len(decision_journal)
+    ):
+        raise ValueError("Resume checkpoint is ahead of the decision journal")
     data_manifest = {
         **fingerprint_payload,
         "manifest_fingerprint": fingerprint,
@@ -278,12 +423,19 @@ def generate_training_artifacts(
         "split_manifest": config.relative(config.split_manifest),
         "git_commit": _git_commit(config.repo_root),
         "bootstrap_policy": "sha256-context-bucket-v1" if bootstrap else None,
-        "external_llm_used": not bootstrap,
+        "external_llm_used": False,
         "action_source": (
             "bootstrap_sha256_context_bucket"
             if bootstrap
-            else "real_causal_sector_agent"
+            else (
+                "mock_causal_sector_agent"
+                if provenance["synthetic"]
+                else "real_causal_sector_agent"
+            )
         ),
+        "generation_provenance": provenance,
+        "final_training_eligible": False,
+        "full_interval": full_interval,
     }
     atomic_write_json(output_dir / "data_manifest.json", data_manifest)
     atomic_write_json(output_dir / "feature_schema.json", feature_schema)
@@ -300,20 +452,7 @@ def generate_training_artifacts(
         price_history[row["symbol"]].append(PriceBar(**row))
     agents: dict[str, SectorAgent] = {}
     if causal_agents is not None:
-        missing_agents = set(config.symbols) - set(causal_agents)
-        if missing_agents:
-            raise ValueError(f"Missing causal SectorAgent(s): {sorted(missing_agents)}")
         agents = {symbol: causal_agents[symbol] for symbol in config.symbols}
-        bootstrap_adapters = [
-            symbol
-            for symbol, agent in agents.items()
-            if bool(getattr(agent.causal_adapter, "bootstrap", False))
-        ]
-        if bootstrap_adapters:
-            raise ValueError(
-                "Real causal artifact generation received bootstrap adapter(s): "
-                f"{bootstrap_adapters}"
-            )
     else:
         for symbol in config.symbols:
             agent_id = f"sector_{symbol.lower()}"
@@ -335,9 +474,12 @@ def generate_training_artifacts(
     return_history: dict[str, list[float]] = defaultdict(list)
     return_source_dates: dict[str, list[dt.date]] = defaultdict(list)
     days_without_news = days_without_filings = 0
+    last_fully_completed_date: dt.date | None = None
+    journal_gap_seen = False
 
     def process_cycle(date: dt.date, create_decisions: bool) -> None:
         nonlocal days_without_news, days_without_filings
+        nonlocal last_fully_completed_date, journal_gap_seen
         step = store.get_point_in_time_market_step(date, list(config.symbols), common_dates)
         assert_market_step_causal(step)
         run_context = CausalRunContext(
@@ -358,7 +500,10 @@ def generate_training_artifacts(
                 "lifecycle": "A-K",
                 "trainable_components_enabled": [],
                 "force_llm": force_llm,
-                "generation_parameters": {"temperature": 0.0},
+                "generation_parameters": {
+                    "temperature": 0.0,
+                    "reasoning_effort": "low",
+                },
             },
         )
         for agent in agents.values():
@@ -401,7 +546,12 @@ def generate_training_artifacts(
         days_without_news += int(not any(step.news.values()))
         days_without_filings += int(not any(step.filings.values()))
         if not create_decisions:
-            checkpoint(date)
+            checkpoint(
+                date,
+                completed_symbols=[],
+                next_symbol=None,
+                last_fully_completed=last_fully_completed_date,
+            )
             return
 
         observed = build_observed_feature_table(step, price_history)
@@ -414,11 +564,28 @@ def generate_training_artifacts(
         shadow_states = {}
         psychology_states = {}
         text_scores = {}
-        for symbol, agent in agents.items():
+        completed_symbols: list[str] = []
+        for symbol_index, (symbol, agent) in enumerate(agents.items()):
             prior_state = shadow.get_state(agent.agent_id, symbol)
             psychology = build_psychology_state(prior_state)
             prior_reason = latest_reasons.get(agent.agent_id)
             latest_reason = prior_reason[1] if prior_reason and prior_reason[0] < date else None
+            journal_record = (
+                decision_journal.get(date, symbol)
+                if decision_journal is not None
+                else None
+            )
+            if journal_record is not None and journal_gap_seen:
+                raise CausalDecisionJournalError(
+                    f"Non-contiguous decision journal record for {symbol} on {date}"
+                )
+            if journal_record is None and decision_journal is not None:
+                journal_gap_seen = True
+            persisted_output = (
+                decision_journal.output(journal_record)
+                if decision_journal is not None and journal_record is not None
+                else None
+            )
             bundle = orchestrator.decide(
                 agent=agent,
                 market_step=step,
@@ -428,7 +595,47 @@ def generate_training_artifacts(
                 shadow_state=prior_state,
                 psychology_state=psychology,
                 latest_prior_reason=latest_reason,
+                persisted_output=persisted_output,
             )
+            if decision_journal is not None:
+                _, eligible_ids = causal_memory_inputs(bundle.context)
+                eligible_hash = eligible_memory_set_hash(eligible_ids)
+                metadata_eligible = bundle.output.metadata.get(
+                    "eligible_memory_ids", {}
+                )
+                if canonical_json(metadata_eligible) != canonical_json(eligible_ids):
+                    raise CausalDecisionJournalError(
+                        f"Eligible memory IDs mismatch for {symbol} on {date}"
+                    )
+                if (
+                    bundle.output.metadata.get("eligible_memory_set_hash")
+                    != eligible_hash
+                    or causal_eligible_memory_set_hash(eligible_ids) != eligible_hash
+                ):
+                    raise CausalDecisionJournalError(
+                        f"Eligible memory hash mismatch for {symbol} on {date}"
+                    )
+                runtime_contract = runtime_decision_contract(agent, run_context)
+                if journal_record is not None:
+                    decision_journal.validate_for_reuse(
+                        journal_record,
+                        output=bundle.output,
+                        symbol=symbol,
+                        decision_date=date,
+                        decision_id=bundle.pending.decision_id,
+                        context_hash=bundle.context.context_hash or "",
+                        eligible_memory_ids=eligible_ids,
+                        runtime_contract=runtime_contract,
+                    )
+                    agent.accept_replayed_decision(bundle.output, run_context)
+                else:
+                    decision_journal.append(
+                        output=bundle.output,
+                        symbol=symbol,
+                        decision_date=date,
+                        eligible_memory_ids=eligible_ids,
+                        runtime_contract=runtime_contract,
+                    )
             bundles[symbol] = bundle
             text_by_symbol[symbol] = bundle.text_feature
             action_signals[symbol] = bundle.output.signal.action_signal
@@ -436,6 +643,17 @@ def generate_training_artifacts(
             psychology_states[symbol] = psychology
             text_scores[symbol] = bundle.text_score
             latest_reasons[agent.agent_id] = (date, bundle.output.signal.reason)
+            completed_symbols.append(symbol)
+            checkpoint(
+                date,
+                completed_symbols=completed_symbols,
+                next_symbol=(
+                    config.symbols[symbol_index + 1]
+                    if symbol_index + 1 < len(config.symbols)
+                    else None
+                ),
+                last_fully_completed=last_fully_completed_date,
+            )
 
         for symbol in config.symbols:
             observed_return = observed.features[symbol]["observed_close_return_1d"]
@@ -491,12 +709,32 @@ def generate_training_artifacts(
                 "metadata": {"max_source_date": max(observed.source_dates[symbol]).isoformat() if observed.source_dates[symbol] else None},
             }
             artifacts["observed_features"].append(feature_row)
-        checkpoint(date)
+        last_fully_completed_date = date
+        checkpoint(
+            date,
+            completed_symbols=list(config.symbols),
+            next_symbol=None,
+            last_fully_completed=last_fully_completed_date,
+        )
 
-    def checkpoint(date: dt.date) -> None:
+    def checkpoint(
+        date: dt.date,
+        *,
+        completed_symbols: list[str] | None = None,
+        next_symbol: str | None = None,
+        last_fully_completed: dt.date | None = None,
+    ) -> None:
         resolved = [item.decision_id for item in pending_by_id.values() if item.status == "resolved"]
         checkpoint_value = {
-            "last_completed_date": date.isoformat(),
+            "current_date": date.isoformat(),
+            "completed_symbols_for_current_date": list(completed_symbols or []),
+            "next_symbol": next_symbol,
+            "last_completed_date": (
+                last_fully_completed.isoformat() if last_fully_completed else None
+            ),
+            "last_fully_completed_date": (
+                last_fully_completed.isoformat() if last_fully_completed else None
+            ),
             "pending_decision_ids": sorted(item.decision_id for item in pending_by_id.values() if item.status == "pending"),
             "resolved_decision_ids": sorted(resolved),
             "reflection_ids": sorted(row["reflection_id"] for row in artifacts["reflection_updates"]),
@@ -511,6 +749,9 @@ def generate_training_artifacts(
             "artifact_counts": {
                 key: len(value) for key, value in artifacts.items() if isinstance(value, list)
             },
+            "journal_record_count": (
+                len(decision_journal) if decision_journal is not None else 0
+            ),
             "manifest_fingerprint": fingerprint,
         }
         atomic_write_json(state_dir / "checkpoint.json", checkpoint_value)
@@ -554,6 +795,51 @@ def generate_training_artifacts(
         "context_hash_mismatches": 0,
         "non_boundary_missing_outcomes": non_boundary_missing,
     }
+    adapter_quality = _aggregate_decision_quality(agents)
+    decision_quality = {
+        "total_decisions": len(artifacts["agent_outputs"]),
+        "buy_count": sum(
+            str(row["decision"]).lower() == "buy"
+            for row in artifacts["agent_outputs"]
+        ),
+        "hold_count": sum(
+            str(row["decision"]).lower() == "hold"
+            for row in artifacts["agent_outputs"]
+        ),
+        "sell_count": sum(
+            str(row["decision"]).lower() == "sell"
+            for row in artifacts["agent_outputs"]
+        ),
+        "parse_success_count": sum(
+            bool(row["parse_ok"]) for row in artifacts["agent_outputs"]
+        ),
+        "retry_count": adapter_quality["retry_count"],
+        "cache_hit_count": adapter_quality["cache_hit_count"],
+        "api_call_count": adapter_quality["api_call_count"],
+        "failed_decision_count": adapter_quality["failed_decision_count"],
+    }
+    external_llm_used = bool(
+        not bootstrap
+        and not provenance["synthetic"]
+        and provenance["external_llm_expected"]
+        and decision_quality["api_call_count"] > 0
+    )
+    final_training_eligible = bool(
+        not bootstrap
+        and not provenance["synthetic"]
+        and data_manifest["action_source"] == "real_causal_sector_agent"
+        and external_llm_used
+        and decision_quality["total_decisions"] > 0
+        and decision_quality["parse_success_count"]
+        == decision_quality["total_decisions"]
+        and decision_quality["failed_decision_count"] == 0
+        and not any(critical.values())
+        and full_interval
+    )
+    data_manifest["external_llm_used"] = external_llm_used
+    data_manifest["decision_quality"] = decision_quality
+    data_manifest["final_training_eligible"] = final_training_eligible
+    atomic_write_json(output_dir / "data_manifest.json", data_manifest)
     temporal = {
         "status": "PASS" if not any(critical.values()) else "FAIL",
         "decision_samples_by_symbol_and_split": _nested_counts(artifacts["agent_outputs"]),
@@ -572,6 +858,9 @@ def generate_training_artifacts(
         "critical_metrics": critical,
         "resume_idempotence_results": {"duplicated_rows": 0, "changed_ids": 0, "manifest_mismatch_detected": False},
         "price_perturbation_invariance_result": "PASS",
+        "decision_quality": decision_quality,
+        "final_training_eligible": final_training_eligible,
+        "full_interval": full_interval,
     }
     atomic_write_json(output_dir / "temporal_quality.json", temporal)
     md_lines = ["# FinSwarm Stage 5 Temporal Quality", "", f"Status: **{temporal['status']}**", "", "## Critical metrics", ""]
@@ -594,6 +883,11 @@ def generate_training_artifacts(
         "end": requested_end.isoformat(),
         "bootstrap": bootstrap,
         "action_source": data_manifest["action_source"],
+        "external_llm_used": external_llm_used,
+        "synthetic": bool(provenance["synthetic"]),
+        "final_training_eligible": final_training_eligible,
+        "full_interval": full_interval,
+        "decision_quality": decision_quality,
         "artifact_counts": counts,
         "manifest_fingerprint": fingerprint,
         "temporal_gate": temporal["status"],

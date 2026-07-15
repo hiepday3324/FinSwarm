@@ -8,7 +8,12 @@ import torch
 
 from .checkpoint import atomic_json, seed_everything, state_dict_sha256
 from .config import TrainingConfig
-from .fusion_trainer import _arrays, load_fusion_model, selected_fusion_logits
+from .fusion_trainer import (
+    CANONICAL_FUSION_SELECTION,
+    _arrays,
+    load_fusion_model,
+    selected_fusion_logits,
+)
 from .metrics import binary_metrics
 from .split import EffectiveSplits
 from .training_guard import SplitAccessGuard
@@ -70,9 +75,12 @@ def calibrate_fusion(
     expected_dates = set(splits.validation_calibration)
     if not rows or any(row["decision_date"] not in expected_dates for row in rows):
         raise ValueError("Calibration received rows outside validation-calibration")
-    values = _arrays(rows)
     model, selected = load_fusion_model(
         config.model_dir / "fusion_model.pt", device=device
+    )
+    values = _arrays(
+        rows,
+        require_latents=selected == CANONICAL_FUSION_SELECTION,
     )
     before_hash = state_dict_sha256(model.state_dict())
     logits = selected_fusion_logits(model, selected, values, device=device)

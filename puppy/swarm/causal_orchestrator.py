@@ -150,6 +150,7 @@ class CausalOrchestrator:
         shadow_state: ShadowPortfolioState | None = None,
         psychology_state: dict[str, Any] | None = None,
         latest_prior_reason: str | None = None,
+        persisted_output: AgentOutput | None = None,
     ) -> CausalDecisionBundle:
         assert_shadow_prior(shadow_state, market_step.date)
         adapter = agent.causal_adapter
@@ -214,11 +215,25 @@ class CausalOrchestrator:
                 probability = probability.detach().cpu().numpy()
             text_score = float(np.asarray(probability).reshape(-1)[0])
             text_feature.metadata["text_score"] = text_score
-        output = agent.decide(market_step, context.model_copy(deep=True), run_context)
-        output.decision_id = decision_id
-        output.h_text = list(text_feature.h_text)
-        output.raw_context = text_feature.raw_context
-        output.metadata["text_score"] = text_score
+        if persisted_output is None:
+            output = agent.decide(
+                market_step, context.model_copy(deep=True), run_context
+            )
+            output.decision_id = decision_id
+            output.h_text = list(text_feature.h_text)
+            output.raw_context = text_feature.raw_context
+            output.metadata["text_score"] = text_score
+        else:
+            output = persisted_output.model_copy(deep=True)
+            self._validate_persisted_output(
+                output=output,
+                agent=agent,
+                run_context=run_context,
+                decision_id=decision_id,
+                context_hash=str(context.context_hash),
+                text_feature=text_feature,
+                text_score=text_score,
+            )
         context_snapshot = {
             "agent_context": context.model_dump(mode="json"),
             "price_bar": market_step.prices.get(agent.symbol).model_dump(mode="json") if agent.symbol in market_step.prices else None,
@@ -248,6 +263,43 @@ class CausalOrchestrator:
             metadata={"split": split, "context_built_before_output": True},
         )
         return CausalDecisionBundle(context, text_feature, text_score, output, pending)
+
+    @staticmethod
+    def _validate_persisted_output(
+        *,
+        output: AgentOutput,
+        agent: Any,
+        run_context: CausalRunContext,
+        decision_id: str,
+        context_hash: str,
+        text_feature: TextFeature,
+        text_score: float | None,
+    ) -> None:
+        decision = str(output.signal.decision).lower()
+        expected_action = {"sell": -1, "hold": 0, "buy": 1}.get(decision)
+        checks = {
+            "agent_id": output.signal.agent_id == agent.agent_id,
+            "symbol": output.signal.symbol == agent.symbol,
+            "date": output.signal.date == run_context.current_date,
+            "decision_id": output.decision_id == decision_id,
+            "context_hash": output.context_hash == context_hash,
+            "decision_cutoff": output.decision_cutoff == run_context.current_cutoff,
+            "prompt_version": output.prompt_version == run_context.prompt_version,
+            "adapter_version": output.adapter_version == run_context.adapter_version,
+            "parse_ok": bool(output.parse_ok),
+            "action_contract": (
+                expected_action is not None
+                and output.signal.action_signal == expected_action
+            ),
+            "h_text": output.h_text == list(text_feature.h_text),
+            "raw_context": output.raw_context == text_feature.raw_context,
+            "text_score": output.metadata.get("text_score") == text_score,
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        if failed:
+            raise ValueError(
+                "Persisted canonical AgentOutput mismatch: " + ", ".join(failed)
+            )
 
     def run_canonical_streams(
         self,

@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import torch
 
 from puppy.fusion.gated_fusion import LatentGatedFusion
+from puppy.fusion.scalar_logit_stack import GraphOnlyFusion, ScalarLogitStack
 
 from .checkpoint import atomic_json, atomic_torch_save, seed_everything, state_dict_sha256
 from .config import TrainingConfig
@@ -21,18 +22,37 @@ from .training_guard import SplitAccessGuard
 
 CanonicalFusionModel = LatentGatedFusion
 CANONICAL_FUSION_SELECTION = "canonical_latent_fusion"
+SCALAR_FUSION_SELECTION = "scalar_logit_stack"
+GRAPH_ONLY_SELECTION = "graph_only"
+FusionModel = LatentGatedFusion | ScalarLogitStack | GraphOnlyFusion
 
 
-def _arrays(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+def _configured_selection(head: str) -> str:
+    selections = {
+        "latent_gate": CANONICAL_FUSION_SELECTION,
+        "scalar_logit_stack": SCALAR_FUSION_SELECTION,
+        "graph_only": GRAPH_ONLY_SELECTION,
+    }
+    try:
+        return selections[head]
+    except KeyError as error:
+        raise ValueError(f"Unsupported fusion head: {head!r}") from error
+
+
+def _arrays(
+    rows: list[dict[str, Any]],
+    *,
+    require_latents: bool = True,
+) -> dict[str, np.ndarray]:
     if not rows:
         raise ValueError("Fusion dataset is empty")
-    required = ("h_text", "h_graph", "text_logit", "graph_logit", "target", "symbol")
+    required = ["text_logit", "graph_logit", "target", "symbol"]
+    if require_latents:
+        required.extend(("h_text", "h_graph"))
     missing = [name for name in required if any(row.get(name) is None for row in rows)]
     if missing:
-        raise ValueError(f"Latent fusion rows are missing required fields: {missing}")
-    return {
-        "h_text": np.asarray([row["h_text"] for row in rows], dtype=np.float32),
-        "h_graph": np.asarray([row["h_graph"] for row in rows], dtype=np.float32),
+        raise ValueError(f"Fusion rows are missing required fields: {missing}")
+    values = {
         "text_logit": np.asarray([row["text_logit"] for row in rows], dtype=np.float32),
         "graph_logit": np.asarray([row["graph_logit"] for row in rows], dtype=np.float32),
         "text_probability": np.asarray(
@@ -46,6 +66,12 @@ def _arrays(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
         "target": np.asarray([row["target"] for row in rows], dtype=np.float32),
         "symbol": np.asarray([row["symbol"] for row in rows]),
     }
+    if require_latents:
+        values["h_text"] = np.asarray([row["h_text"] for row in rows], dtype=np.float32)
+        values["h_graph"] = np.asarray([row["h_graph"] for row in rows], dtype=np.float32)
+    if not all(np.isfinite(value).all() for key, value in values.items() if key != "symbol"):
+        raise ValueError("Fusion rows contain non-finite numeric values")
+    return values
 
 
 def _positive_weight(targets: np.ndarray) -> float:
@@ -178,14 +204,109 @@ def fit_fusion(
         "initial_state_sha256": initial_hash,
         "best_state_sha256": restored_hash,
         "best_checkpoint_restored": restored_hash == state_dict_sha256(best_state),
+        "learnable_module": True,
+    }
+
+
+def fit_scalar_logit_stack(
+    train_values: dict[str, np.ndarray],
+    validation_values: dict[str, np.ndarray],
+    model_config: dict[str, Any],
+    *,
+    seed: int,
+    device: str = "cpu",
+) -> tuple[ScalarLogitStack, dict[str, Any]]:
+    seed_everything(seed)
+    model = ScalarLogitStack().to(device)
+    initial_hash = state_dict_sha256(model.state_dict())
+    regularization = float(model_config["weight_decay"])
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=float(model_config["learning_rate"])
+    )
+    loss_function = torch.nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(_positive_weight(train_values["target"]), device=device)
+    )
+    batch_size = int(model_config["batch_size"])
+    max_epochs = int(model_config["max_epochs"])
+    patience = int(model_config["patience"])
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    best_loss = float("inf")
+    best_epoch = -1
+    best_state: dict[str, torch.Tensor] | None = None
+    stale = 0
+    curves: list[dict[str, float | int]] = []
+    for epoch in range(max_epochs):
+        model.train()
+        order = torch.randperm(len(train_values["target"]), generator=generator)
+        total_loss = 0.0
+        for start in range(0, len(order), batch_size):
+            indices = order[start : start + batch_size].numpy()
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(
+                torch.as_tensor(train_values["text_logit"][indices], device=device),
+                torch.as_tensor(train_values["graph_logit"][indices], device=device),
+            )
+            targets = torch.as_tensor(
+                train_values["target"][indices], dtype=torch.float32, device=device
+            )
+            loss = loss_function(logits, targets) + regularization * torch.sum(
+                model.weights.square()
+            )
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach()) * len(indices)
+        validation_logits = selected_fusion_logits(
+            model, SCALAR_FUSION_SELECTION, validation_values, device=device
+        )
+        validation_loss = float(
+            binary_metrics(
+                validation_values["target"], _probability(validation_logits)
+            )["log_loss"]
+        )
+        curves.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": total_loss / len(train_values["target"]),
+                "validation_log_loss": validation_loss,
+            }
+        )
+        if validation_loss < best_loss - 1e-8:
+            best_loss = validation_loss
+            best_epoch = epoch + 1
+            best_state = copy.deepcopy(model.state_dict())
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                break
+    if best_state is None:
+        raise RuntimeError("Scalar logit stack produced no checkpoint")
+    model.load_state_dict(best_state)
+    restored_hash = state_dict_sha256(model.state_dict())
+    return model, {
+        "learning_curve": curves,
+        "best_epoch": best_epoch,
+        "best_validation_log_loss": best_loss,
+        "parameter_changed": initial_hash != restored_hash,
+        "initial_state_sha256": initial_hash,
+        "best_state_sha256": restored_hash,
+        "best_checkpoint_restored": restored_hash == state_dict_sha256(best_state),
+        "learnable_module": True,
+        "regularization": {
+            "type": "l2",
+            "strength": regularization,
+            "applies_to": ["weight_text", "weight_graph"],
+            "intercept_regularized": False,
+        },
     }
 
 
 def _candidate_metrics(
     values: dict[str, np.ndarray],
     fusion_probability: np.ndarray,
+    selected: str = CANONICAL_FUSION_SELECTION,
 ) -> dict[str, dict[str, Any]]:
-    return {
+    candidates = {
         "text_only": binary_metrics(
             values["target"], _probability(values["text_logit"]), symbols=values["symbol"]
         ),
@@ -195,10 +316,11 @@ def _candidate_metrics(
         "fixed_0.5_average": binary_metrics(
             values["target"], _probability(fixed_average_logits(values)), symbols=values["symbol"]
         ),
-        CANONICAL_FUSION_SELECTION: binary_metrics(
-            values["target"], fusion_probability, symbols=values["symbol"]
-        ),
     }
+    candidates[selected] = binary_metrics(
+        values["target"], fusion_probability, symbols=values["symbol"]
+    )
+    return candidates
 
 
 def train_fusion(
@@ -217,81 +339,154 @@ def train_fusion(
         config, splits, guard=guard, device=device
     )
     oof_rows = pq.read_table(config.model_dir / "oof_predictions.parquet").to_pylist()
+    selected = _configured_selection(config.fusion_head)
+    require_latents = selected == CANONICAL_FUSION_SELECTION
     validate_oof_rows(
         oof_rows,
         int(config.split["embargo_trading_days"]),
         trading_dates=splits.train_effective,
+        require_latents=require_latents,
     )
     validation_rows = pq.read_table(
         config.model_dir / "validation_base_predictions.parquet",
         filters=[("partition", "=", "validation_selection")],
     ).to_pylist()
-    train_values = _arrays(oof_rows)
-    validation_values = _arrays(validation_rows)
-    model, training = fit_fusion(
-        train_values,
-        validation_values,
-        config.fusion_model,
-        seed=seed,
-        device=device,
-    )
-    _, train_probability, train_gate = predict_fusion(model, train_values, device=device)
-    validation_logits, validation_probability, validation_gate = predict_fusion(
-        model, validation_values, device=device
-    )
-    candidates = _candidate_metrics(validation_values, validation_probability)
+    train_values = _arrays(oof_rows, require_latents=require_latents)
+    validation_values = _arrays(validation_rows, require_latents=require_latents)
+
+    if selected == CANONICAL_FUSION_SELECTION:
+        model, training = fit_fusion(
+            train_values,
+            validation_values,
+            config.fusion_model,
+            seed=seed,
+            device=device,
+        )
+        _, train_probability, train_gate = predict_fusion(model, train_values, device=device)
+        validation_logits, validation_probability, validation_gate = predict_fusion(
+            model, validation_values, device=device
+        )
+        fit_source = "expanding_window_oof_latents_only"
+    elif selected == SCALAR_FUSION_SELECTION:
+        model, training = fit_scalar_logit_stack(
+            train_values,
+            validation_values,
+            config.fusion_model,
+            seed=seed,
+            device=device,
+        )
+        train_logits = selected_fusion_logits(model, selected, train_values, device=device)
+        validation_logits = selected_fusion_logits(
+            model, selected, validation_values, device=device
+        )
+        train_probability = _probability(train_logits)
+        validation_probability = _probability(validation_logits)
+        train_gate = validation_gate = None
+        fit_source = "expanding_window_oof_scalar_logits_only"
+    else:
+        model = GraphOnlyFusion().to(device)
+        validation_logits = validation_values["graph_logit"].copy()
+        validation_probability = _probability(validation_logits)
+        train_probability = _probability(train_values["graph_logit"])
+        train_gate = validation_gate = None
+        graph_loss = float(
+            binary_metrics(validation_values["target"], validation_probability)["log_loss"]
+        )
+        state_hash = state_dict_sha256(model.state_dict())
+        training = {
+            "learning_curve": [],
+            "best_epoch": 0,
+            "best_validation_log_loss": graph_loss,
+            "parameter_changed": None,
+            "initial_state_sha256": state_hash,
+            "best_state_sha256": state_hash,
+            "best_checkpoint_restored": True,
+            "learnable_module": False,
+        }
+        fit_source = "configured_graph_stream_only"
+
+    candidates = _candidate_metrics(validation_values, validation_probability, selected)
     best_ablation = min(
-        (name for name in candidates if name != CANONICAL_FUSION_SELECTION),
+        (name for name in candidates if name != selected),
         key=lambda name: candidates[name]["log_loss"],
     )
-    checkpoint = {
-        "model_type": CANONICAL_FUSION_SELECTION,
+    checkpoint: dict[str, Any] = {
+        "model_type": selected,
         "architecture": model.architecture_config(),
         "state_dict": model.state_dict(),
-        "selected_fusion_model": CANONICAL_FUSION_SELECTION,
+        "selected_fusion_model": selected,
         "seed": seed,
         "best_epoch": training["best_epoch"],
+        "training_source": fit_source,
+        "ablation_fingerprint": config.ablation_fingerprint,
         "validation_prediction_probe": {
             "logit": float(validation_logits[0]),
             "probability": float(validation_probability[0]),
-            "gate": validation_gate[0].tolist(),
         },
     }
+    if selected == CANONICAL_FUSION_SELECTION:
+        checkpoint["validation_prediction_probe"]["gate"] = validation_gate[0].tolist()
+    if selected == SCALAR_FUSION_SELECTION:
+        checkpoint["coefficients"] = {
+            "intercept": float(model.intercept.detach().cpu()),
+            "weight_text": float(model.weights[0].detach().cpu()),
+            "weight_graph": float(model.weights[1].detach().cpu()),
+        }
+        checkpoint["regularization"] = training["regularization"]
     atomic_torch_save(config.model_dir / "fusion_model.pt", checkpoint)
-    loaded, selected = load_fusion_model(config.model_dir / "fusion_model.pt", device=device)
-    loaded_logits, _, _ = predict_fusion(loaded, validation_values, device=device)
+    loaded, loaded_selection = load_fusion_model(
+        config.model_dir / "fusion_model.pt", device=device
+    )
+    loaded_logits = selected_fusion_logits(
+        loaded, loaded_selection, validation_values, device=device
+    )
     save_load_equivalent = bool(
-        selected == CANONICAL_FUSION_SELECTION
+        loaded_selection == selected
         and np.allclose(loaded_logits, validation_logits, atol=1e-7, rtol=1e-6)
     )
-    if not training["parameter_changed"] or not training["best_checkpoint_restored"]:
-        raise RuntimeError("Latent fusion did not produce a valid trained checkpoint")
+    if training["learnable_module"] and (
+        not training["parameter_changed"] or not training["best_checkpoint_restored"]
+    ):
+        raise RuntimeError(f"{selected} did not produce a valid trained checkpoint")
     if not save_load_equivalent:
-        raise RuntimeError("Latent fusion save/load prediction mismatch")
-    history = {
+        raise RuntimeError(f"{selected} save/load prediction mismatch")
+    history: dict[str, Any] = {
         **training,
-        "selected_fusion_model": CANONICAL_FUSION_SELECTION,
-        "production_selection_rule": "canonical_architecture_fixed",
+        "selected_fusion_model": selected,
+        "configured_fusion_head": config.fusion_head,
+        "production_selection_rule": "strict_configured_head",
         "best_validation_ablation": best_ablation,
-        "fit_source": "expanding_window_oof_latents_only",
+        "fit_source": fit_source,
         "oof_only_verified": True,
         "oof_train_rows": len(oof_rows),
         "validation_selection_rows": len(validation_rows),
+        "validation_calibration_rows_used_for_selection": 0,
+        "test_rows_accessed": 0,
         "candidate_validation_selection_metrics": candidates,
-        "canonical_fusion_oof_metrics": binary_metrics(
+        "selected_fusion_oof_metrics": binary_metrics(
             train_values["target"], train_probability, symbols=train_values["symbol"]
         ),
-        "gate_values": {
+        "latent_vectors_required": require_latents,
+        "fixed_average_baseline_reported": True,
+        "save_load_prediction_equivalent": save_load_equivalent,
+        "validation_base_predictions": validation_summary,
+        "ablation_fingerprint": config.ablation_fingerprint,
+    }
+    if selected == CANONICAL_FUSION_SELECTION:
+        history["canonical_fusion_oof_metrics"] = history["selected_fusion_oof_metrics"]
+        history["gate_values"] = {
             "oof_mean": float(np.mean(train_gate)),
             "oof_min": float(np.min(train_gate)),
             "oof_max": float(np.max(train_gate)),
             "validation_mean": float(np.mean(validation_gate)),
-        },
-        "latent_dimensions": model.architecture_config(),
-        "fixed_average_baseline_reported": True,
-        "save_load_prediction_equivalent": save_load_equivalent,
-        "validation_base_predictions": validation_summary,
-    }
+        }
+        history["latent_dimensions"] = model.architecture_config()
+    elif selected == SCALAR_FUSION_SELECTION:
+        history["coefficients"] = checkpoint["coefficients"]
+        history["prediction_equation"] = (
+            "fusion_logit = intercept + weight_text * text_logit + "
+            "weight_graph * graph_logit"
+        )
     atomic_json(config.model_dir / "fusion_training_history.json", history)
     return history
 
@@ -301,9 +496,13 @@ def validate_oof_rows(
     embargo_days: int,
     *,
     trading_dates: tuple[Any, ...] | None = None,
+    require_latents: bool = True,
 ) -> None:
     if not rows or not all(bool(row.get("is_oof")) for row in rows):
         raise ValueError("Fusion requires OOF-only training predictions")
+    decision_ids = [str(row.get("decision_id", "")) for row in rows]
+    if "" in decision_ids or len(decision_ids) != len(set(decision_ids)):
+        raise ValueError("Fusion requires unique non-empty OOF decision IDs")
     for row in rows:
         if not row["model_train_end"] < row["decision_date"]:
             raise ValueError("Fusion received an in-sample base prediction")
@@ -312,9 +511,11 @@ def validate_oof_rows(
         if not bool(row.get("text_prediction_is_oof")):
             raise ValueError("Fusion requires out-of-fold Text predictions")
         if not bool(row.get("graph_representation_is_oof")):
-            raise ValueError("Fusion requires out-of-fold H_graph representations")
-        if row.get("h_text") is None or row.get("h_graph") is None:
-            raise ValueError("Fusion requires H_text and OOF H_graph latent vectors")
+            raise ValueError("Fusion requires out-of-fold Graph predictions")
+        if row.get("text_logit") is None or row.get("graph_logit") is None:
+            raise ValueError("Fusion requires OOF Text and Graph logits")
+        if require_latents and (row.get("h_text") is None or row.get("h_graph") is None):
+            raise ValueError("Latent fusion requires H_text and OOF H_graph vectors")
     if trading_dates is not None:
         positions = {date: index for index, date in enumerate(trading_dates)}
         for row in rows:
@@ -330,24 +531,42 @@ def load_fusion_model(
     path: str | Path,
     *,
     device: str = "cpu",
-) -> tuple[LatentGatedFusion, str]:
+) -> tuple[FusionModel, str]:
     checkpoint = torch.load(Path(path), map_location=device, weights_only=False)
     selected = str(checkpoint.get("selected_fusion_model", ""))
-    if selected != CANONICAL_FUSION_SELECTION:
-        raise ValueError("Production bundle must select canonical latent fusion")
-    model = LatentGatedFusion.from_config(checkpoint["architecture"]).to(device)
+    if selected == CANONICAL_FUSION_SELECTION:
+        model: FusionModel = LatentGatedFusion.from_config(checkpoint["architecture"])
+    elif selected == SCALAR_FUSION_SELECTION:
+        model = ScalarLogitStack.from_config(checkpoint["architecture"])
+    elif selected == GRAPH_ONLY_SELECTION:
+        model = GraphOnlyFusion.from_config(checkpoint["architecture"])
+    else:
+        raise ValueError(f"Unsupported fusion checkpoint selection: {selected!r}")
+    model = model.to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return model, selected
 
 
 def selected_fusion_logits(
-    model: LatentGatedFusion,
+    model: FusionModel,
     selected: str,
     values: dict[str, np.ndarray],
     *,
     device: str = "cpu",
 ) -> np.ndarray:
-    if selected != CANONICAL_FUSION_SELECTION:
-        raise ValueError("Production inference cannot select a Text-only or Graph-only ablation")
-    return predict_fusion(model, values, device=device)[0]
+    if selected == CANONICAL_FUSION_SELECTION:
+        if not isinstance(model, LatentGatedFusion):
+            raise TypeError("Latent fusion selection requires LatentGatedFusion")
+        return predict_fusion(model, values, device=device)[0]
+    if selected not in {SCALAR_FUSION_SELECTION, GRAPH_ONLY_SELECTION}:
+        raise ValueError(f"Unsupported fusion selection: {selected!r}")
+    if not isinstance(model, (ScalarLogitStack, GraphOnlyFusion)):
+        raise TypeError(f"{selected} has an incompatible model class")
+    model.eval()
+    with torch.no_grad():
+        logits = model(
+            torch.as_tensor(values["text_logit"], dtype=torch.float32, device=device),
+            torch.as_tensor(values["graph_logit"], dtype=torch.float32, device=device),
+        )
+    return logits.cpu().numpy()

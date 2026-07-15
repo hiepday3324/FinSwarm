@@ -19,7 +19,7 @@ TEXT_COLUMNS = [
 ]
 OUTPUT_COLUMNS = [
     "decision_id", "run_id", "agent_id", "symbol", "decision_date", "decision_cutoff",
-    "decision", "action_signal", "reason", "parse_ok", "context_hash", "prompt_version",
+    "decision", "action_signal", "reason", "parse_ok", "model_name", "context_hash", "prompt_version",
     "adapter_version", "text_score", "split", "metadata",
 ]
 OBSERVED_COLUMNS = [

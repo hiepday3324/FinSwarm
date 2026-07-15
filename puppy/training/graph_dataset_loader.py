@@ -39,6 +39,12 @@ POLICY_DEPENDENT_GRAPH_FIELDS = {
 }
 
 
+def configured_graph_feature_names(config: TrainingConfig) -> tuple[str, ...]:
+    if config.graph_includes_text_score:
+        return GRAPH_FEATURE_NAMES
+    return tuple(name for name in GRAPH_FEATURE_NAMES if name != "text_score")
+
+
 @dataclass(frozen=True)
 class GraphDataset:
     sample_ids: np.ndarray
@@ -102,7 +108,22 @@ def load_graph_dataset(
     text_scores_by_decision: Mapping[str, float] | None = None,
     require_oof_text_scores: bool = False,
 ) -> GraphDataset:
+    """Load canonical graph shards and align optional text-score overrides.
+
+    ``require_oof_text_scores`` is retained as a legacy API name. Overrides are
+    fold OOF predictions for training data and final canonical-model predictions
+    for validation data. Strict presence checks apply only to supervised nodes.
+    """
     guard = guard or SplitAccessGuard()
+    include_text_score = config.graph_includes_text_score
+    if not include_text_score and text_scores_by_decision is not None:
+        raise ValueError(
+            "graph.include_text_score=false forbids text-score overrides"
+        )
+    if not include_text_score and require_oof_text_scores:
+        raise ValueError(
+            "graph.include_text_score=false cannot require text-score overrides"
+        )
     requested_dates = tuple(
         sorted(
             set(dates)
@@ -141,15 +162,18 @@ def load_graph_dataset(
         (config.artifact_dir / "feature_schema.json").read_text(encoding="utf-8")
     )
     source_names = list(feature_schema["graph_feature_names"])
-    missing = [name for name in GRAPH_FEATURE_NAMES if name not in source_names]
+    selected_names = configured_graph_feature_names(config)
+    missing = [name for name in selected_names if name not in source_names]
     if missing:
         raise ValueError(f"Stage 5 graph artifact is missing required features: {missing}")
     if tuple(source_names) != GRAPH_FEATURE_NAMES:
         raise ValueError(
             "Stage 5 graph artifact does not use the canonical H0 feature order"
         )
-    indices = [source_names.index(name) for name in GRAPH_FEATURE_NAMES]
-    text_score_index = GRAPH_FEATURE_NAMES.index("text_score")
+    indices = [source_names.index(name) for name in selected_names]
+    text_score_index = (
+        selected_names.index("text_score") if include_text_score else None
+    )
 
     outcome_rows = _outcomes_for_dates(
         config.artifact_dir / "outcomes.parquet", requested_dates
@@ -190,38 +214,48 @@ def load_graph_dataset(
             adjacency = np.asarray(shard["adjacency_matrix"], dtype=np.float32)
             if adjacency.shape != (len(symbols), len(symbols)):
                 raise ValueError(f"Invalid adjacency shape on {date}: {adjacency.shape}")
+            if config.graph_topology == "identity":
+                adjacency = np.eye(len(symbols), dtype=np.float32)
             day_targets = np.zeros(len(symbols), dtype=np.float32)
             day_mask = np.zeros(len(symbols), dtype=bool)
             day_ids = np.full(len(symbols), "", dtype=object)
             for node, symbol in enumerate(symbols):
-                outcome = outcomes.get((date, symbol))
-                if outcome is None:
+                resolved_outcome = outcomes.get((date, symbol))
+                if resolved_outcome is None:
                     continue
-                day_ids[node] = outcome["decision_id"]
-                decision_id = str(outcome["decision_id"])
-                if text_scores_by_decision is not None:
-                    if decision_id in text_scores_by_decision:
-                        score = float(text_scores_by_decision[decision_id])
-                        if not 0.0 <= score <= 1.0:
-                            raise ValueError(
-                                f"OOF text score for {decision_id} is outside [0, 1]"
-                            )
-                        selected[node, text_score_index] = score
-                        selected_mask[node, text_score_index] = True
-                    elif require_oof_text_scores:
-                        raise ValueError(f"Missing OOF text score for {decision_id}")
-                label = int(outcome["direction_label"])
+                day_ids[node] = resolved_outcome["decision_id"]
+                decision_id = str(resolved_outcome["decision_id"])
+                label = int(resolved_outcome["direction_label"])
+                if label not in (-1, 0, 1):
+                    raise ValueError(f"Unexpected graph target {label} on {date} {symbol}")
                 eligible = (
-                    bool(outcome["train_mask"])
-                    and bool(outcome["supervised_eligible"])
-                    and not bool(outcome["cross_split_outcome"])
+                    bool(resolved_outcome["train_mask"])
+                    and bool(resolved_outcome["supervised_eligible"])
+                    and not bool(resolved_outcome["cross_split_outcome"])
                     and label in (-1, 1)
                 )
+                if (
+                    include_text_score
+                    and text_scores_by_decision is not None
+                    and decision_id in text_scores_by_decision
+                ):
+                    score = float(text_scores_by_decision[decision_id])
+                    if not 0.0 <= score <= 1.0:
+                        raise ValueError(
+                            f"Text score override for {decision_id} is outside [0, 1]"
+                        )
+                    if text_score_index is None:
+                        raise AssertionError("Text-score index is unavailable")
+                    selected[node, text_score_index] = score
+                    selected_mask[node, text_score_index] = True
+                elif include_text_score and require_oof_text_scores and eligible:
+                    raise ValueError(
+                        "Missing required text score override for supervised "
+                        f"decision {decision_id}"
+                    )
                 if eligible:
                     day_targets[node] = float(label == 1)
                     day_mask[node] = True
-                elif label not in (-1, 0, 1):
-                    raise ValueError(f"Unexpected graph target {label} on {date} {symbol}")
             sample_ids.append(str(shard["sample_id"].item()))
             matrices.append(selected)
             masks.append(selected_mask)
@@ -241,34 +275,52 @@ def load_graph_dataset(
         targets=np.stack(labels).astype(np.float32),
         label_mask=np.stack(label_masks).astype(bool),
         decision_ids=np.stack(decision_ids),
+        feature_names=selected_names,
         metadata={
             "adapter_only": True,
             "canonical_feature_order_verified": True,
+            "topology": config.graph_topology,
+            "include_text_score": include_text_score,
             "text_score_source": (
                 "oof_by_decision_id"
                 if text_scores_by_decision is not None
+                else "disabled"
+                if not include_text_score
                 else "stage5_causal_or_pending_oof"
             ),
             "oof_text_scores_required": bool(require_oof_text_scores),
         },
     )
-    if result.features.shape[-1] != len(GRAPH_FEATURE_NAMES):
+    if result.features.shape[-1] != len(selected_names):
         raise AssertionError("Graph feature selection shape does not match selected schema")
     return result
 
 
-def graph_feature_schema() -> dict[str, Any]:
+def graph_feature_schema(config: TrainingConfig | None = None) -> dict[str, Any]:
+    feature_names = (
+        configured_graph_feature_names(config)
+        if config is not None
+        else GRAPH_FEATURE_NAMES
+    )
+    include_text_score = "text_score" in feature_names
     return {
         "version": "canonical-graph-features-v2",
-        "feature_names": list(GRAPH_FEATURE_NAMES),
+        "feature_names": list(feature_names),
+        "input_dim": len(feature_names),
+        "topology": config.graph_topology if config is not None else "full",
+        "include_text_score": include_text_score,
         "feature_blocks": {
             "market_features": list(MARKET_FEATURE_NAMES),
             "action_signal": list(ACTION_FEATURE_NAMES),
-            "text_score": list(TEXT_SCORE_FEATURE_NAMES),
+            "text_score": list(TEXT_SCORE_FEATURE_NAMES) if include_text_score else [],
             "prior_shadow_features": list(SHADOW_FEATURE_NAMES),
             "prior_psychology_features": list(PSYCHOLOGY_FEATURE_NAMES),
         },
-        "required_policy_dependent_fields": sorted(POLICY_DEPENDENT_GRAPH_FIELDS),
+        "required_policy_dependent_fields": sorted(
+            POLICY_DEPENDENT_GRAPH_FIELDS
+            if include_text_score
+            else POLICY_DEPENDENT_GRAPH_FIELDS - {"text_score"}
+        ),
         "psychology_encoding": {
             "greed": [1, 0, 0],
             "fear": [0, 1, 0],

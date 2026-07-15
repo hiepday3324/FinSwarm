@@ -65,6 +65,20 @@ def verify_causal_inputs(config: TrainingConfig) -> dict[str, Any]:
         not bootstrap
         and data_manifest.get("action_source") == "real_causal_sector_agent"
         and not data_manifest.get("bootstrap_policy")
+        and data_manifest.get("external_llm_used") is True
+        and data_manifest.get("final_training_eligible") is True
+        and data_manifest.get("full_interval") is True
+        and not bool(
+            (data_manifest.get("generation_provenance") or {}).get(
+                "synthetic", True
+            )
+        )
+        and rollout.get("final_training_eligible") is True
+        and rollout.get("full_interval") is True
+        and (temporal.get("action_audit") or {}).get(
+            "final_training_eligible"
+        )
+        is True
     )
     if not real_actions:
         policy = data_manifest.get("bootstrap_policy", "unknown")
@@ -141,6 +155,8 @@ def _fingerprint(config: TrainingConfig, stage: str, seed: int, device: str) -> 
         "training_code_version": TRAINING_CODE_VERSION,
         "training_code_sha256": training_code_sha256(config.repo_root),
         "config_hash": config.config_hash,
+        "ablation_contract": config.ablation_contract,
+        "ablation_fingerprint": config.ablation_fingerprint,
         "seed": seed,
         "device": device,
         "input_hashes": inputs,
@@ -212,7 +228,7 @@ def run_training_pipeline(
         "text": "train Text Stream",
         "graph": "train Graph Stream",
         "oof": "generate expanding-window OOF predictions",
-        "fusion": "train Gated Fusion",
+        "fusion": "train configured Fusion head",
         "calibrate": "calibrate on validation-calibration",
         "bundle": "save and validate model bundle",
     }

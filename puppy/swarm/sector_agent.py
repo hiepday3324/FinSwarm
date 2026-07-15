@@ -57,6 +57,20 @@ class SectorAgent:
         self.outputs[run_context.current_date] = output
         return output
 
+    def accept_replayed_decision(
+        self,
+        output: AgentOutput,
+        run_context: CausalRunContext,
+    ) -> None:
+        if output.signal.symbol != self.symbol:
+            raise ValueError("Replayed AgentOutput symbol does not match SectorAgent")
+        if output.signal.date != run_context.current_date:
+            raise ValueError("Replayed AgentOutput date does not match run context")
+        if self.causal_adapter is None:
+            raise RuntimeError("Causal adapter must exist before replaying a decision")
+        self.causal_adapter.record_replayed_decision(output)
+        self.outputs[run_context.current_date] = output
+
     def learn_from_outcome(
         self,
         pending_decision: PendingDecision,

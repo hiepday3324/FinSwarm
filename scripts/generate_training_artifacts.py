@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,10 +39,23 @@ def main() -> None:
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--force-llm", action="store_true", help="Reserved for injected non-bootstrap adapters")
+    parser.add_argument(
+        "--force-llm",
+        action="store_true",
+        help="Bypass the causal decision cache without permitting bootstrap fallback",
+    )
     args = parser.parse_args()
     if args.bootstrap and args.agent_factory:
         parser.error("--bootstrap and --agent-factory are mutually exclusive")
+    if (
+        args.agent_factory
+        and args.start is None
+        and args.end is None
+        and os.environ.get("FINMEM_FULL_ROLLOUT_CONFIRMATION") != "YES"
+    ):
+        parser.error(
+            "Full real causal rollout requires FINMEM_FULL_ROLLOUT_CONFIRMATION=YES"
+        )
     injected = {}
     if args.agent_factory:
         injected = dict(_load_agent_factory(args.agent_factory)(args.config))
@@ -57,6 +71,7 @@ def main() -> None:
         encoder=injected.get("encoder"),
         text_score_head=injected.get("text_score_head"),
         prompt_version=injected.get("prompt_version"),
+        generation_provenance=injected.get("provenance"),
     )
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
 

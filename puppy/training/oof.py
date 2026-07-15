@@ -10,13 +10,28 @@ import pyarrow.parquet as pq
 
 from .checkpoint import TrainOnlyScaler, atomic_json
 from .config import TrainingConfig
-from .graph_dataset_loader import GRAPH_FEATURE_NAMES, GraphDataset, load_graph_dataset
+from .graph_dataset_loader import GraphDataset, load_graph_dataset
 from .graph_trainer import fit_gat, fit_graph_scaler, load_gat, predict_gat, scale_graph_dataset
-from .split import EffectiveSplits, OOFFold, build_oof_folds
+from .split import (
+    EffectiveSplits,
+    OOFFold,
+    build_inner_chronological_split,
+    build_oof_folds,
+)
 from .text_dataset import TextDataset, load_supervised_text_dataset
 from .text_embedding import sha256_path
 from .text_trainer import fit_mlp, predict_mlp, selected_text_predictions
 from .training_guard import SplitAccessGuard
+
+
+MINIMUM_HISTORY_CANDIDATES = (
+    (0, 0),
+    (20, 60),
+    (40, 120),
+    (60, 180),
+    (80, 240),
+    (100, 300),
+)
 
 
 def _write_parquet(path: Path, records: list[dict[str, Any]], schema: pa.Schema) -> None:
@@ -45,6 +60,8 @@ def _generate_text_oof(
     device: str,
     fixed_epochs: int,
     manifest_hash: str,
+    training_policy: str,
+    embargo_days: int,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     records: dict[str, dict[str, Any]] = {}
     reports = []
@@ -53,6 +70,44 @@ def _generate_text_oof(
         prediction = text_data.subset(fold.prediction_dates)
         if not len(train) or not len(prediction):
             raise ValueError(f"OOF fold {fold.fold_id} has empty Text data")
+        inner_report: dict[str, Any] | None = None
+        selected_epochs = fixed_epochs
+        if training_policy == "inner_chronological_early_stop":
+            inner = build_inner_chronological_split(
+                fold.train_dates,
+                embargo_days=embargo_days,
+            )
+            inner_train = text_data.subset(inner.train_dates)
+            inner_validation = text_data.subset(inner.validation_dates)
+            if not len(inner_train) or not len(inner_validation):
+                raise ValueError(
+                    f"OOF fold {fold.fold_id} has an empty inner Text segment"
+                )
+            _, inner_train_x, inner_validation_x = _scale_text(
+                inner_train, inner_validation, manifest_hash
+            )
+            _, tuning = fit_mlp(
+                inner_train_x,
+                inner_train.targets,
+                inner_validation_x,
+                inner_validation.targets,
+                config.text_model,
+                seed=seed + fold.fold_id * 2,
+                device=device,
+            )
+            selected_epochs = int(tuning["best_epoch"])
+            inner_report = {
+                "train_start": inner.train_dates[0].isoformat(),
+                "train_end": inner.train_dates[-1].isoformat(),
+                "train_rows": len(inner_train),
+                "embargo_start": inner.embargo_dates[0].isoformat(),
+                "embargo_end": inner.embargo_dates[-1].isoformat(),
+                "embargo_trading_days": len(inner.embargo_dates),
+                "validation_start": inner.validation_dates[0].isoformat(),
+                "validation_end": inner.validation_dates[-1].isoformat(),
+                "validation_rows": len(inner_validation),
+                "selected_epochs": selected_epochs,
+            }
         scaler, train_x, prediction_x = _scale_text(train, prediction, manifest_hash)
         model, history = fit_mlp(
             train_x,
@@ -62,8 +117,12 @@ def _generate_text_oof(
             config.text_model,
             seed=seed + fold.fold_id * 2,
             device=device,
-            fixed_epochs=fixed_epochs,
+            fixed_epochs=selected_epochs,
         )
+        if inner_report is not None and not inner.validation_dates[-1] < fold.prediction_dates[0]:
+            raise ValueError(
+                f"Inner Text validation overlaps outer prediction fold {fold.fold_id}"
+            )
         logits, probabilities = predict_mlp(model, prediction_x, device=device)
         if not history["parameter_changed"]:
             raise RuntimeError(f"OOF TextScoreHead did not train in fold {fold.fold_id}")
@@ -98,6 +157,10 @@ def _generate_text_oof(
                 "prediction_start": fold.prediction_dates[0].isoformat(),
                 "prediction_end": fold.prediction_dates[-1].isoformat(),
                 "prediction_rows": len(prediction),
+                "train_rows": len(train),
+                "training_policy": training_policy,
+                "epochs": selected_epochs,
+                "inner": inner_report,
                 "scaler_fit_start": scaler.metadata["fit_start_date"],
                 "scaler_fit_end": scaler.metadata["fit_end_date"],
                 "parameters_changed": history["parameter_changed"],
@@ -124,6 +187,55 @@ def _complete_oof_graph_train_dates(
         ):
             result.append(date)
     return tuple(result)
+
+
+def minimum_history_coverage_table(
+    records: list[dict[str, Any]],
+    graph_reports: list[dict[str, Any]],
+    symbols: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    complete = {
+        int(report["fold_id"]): report
+        for report in graph_reports
+        if report.get("status") == "complete"
+    }
+    baseline_by_symbol = {
+        symbol: sum(str(row["symbol"]) == symbol for row in records)
+        for symbol in symbols
+    }
+    table = []
+    for minimum_days, minimum_rows in MINIMUM_HISTORY_CANDIDATES:
+        retained = sorted(
+            fold_id
+            for fold_id, report in complete.items()
+            if int(report["graph_train_days"]) >= minimum_days
+            and int(report["graph_train_rows"]) >= minimum_rows
+        )
+        selected = [row for row in records if int(row["fold_id"]) in retained]
+        symbol_coverage = {}
+        for symbol in symbols:
+            count = sum(str(row["symbol"]) == symbol for row in selected)
+            denominator = baseline_by_symbol[symbol]
+            symbol_coverage[symbol] = {
+                "rows": count,
+                "fraction_of_available_oof": (
+                    count / denominator if denominator else 0.0
+                ),
+            }
+        table.append(
+            {
+                "minimum_graph_train_days": minimum_days,
+                "minimum_graph_train_rows": minimum_rows,
+                "folds_retained": retained,
+                "oof_days_retained": len(
+                    {row["decision_date"] for row in selected}
+                ),
+                "oof_supervised_rows_retained": len(selected),
+                "per_symbol_coverage": symbol_coverage,
+                "fusion_rows_remaining": len(selected),
+            }
+        )
+    return table
 
 
 def generate_oof_predictions(
@@ -158,6 +270,8 @@ def generate_oof_predictions(
         int(config.text_model["max_epochs"]),
         int(config.graph_model["max_epochs"]),
     )
+    training_policy = config.oof_training_policy
+    embargo_days = int(config.split["embargo_trading_days"])
     text_oof, text_reports = _generate_text_oof(
         config,
         folds,
@@ -166,6 +280,8 @@ def generate_oof_predictions(
         device=device,
         fixed_epochs=fixed_epochs,
         manifest_hash=manifest_hash,
+        training_policy=training_policy,
+        embargo_days=embargo_days,
     )
     text_scores = {
         decision_id: float(record["text_probability"])
@@ -177,13 +293,19 @@ def generate_oof_predictions(
         dates=splits.train_effective,
         purpose="oof",
         guard=guard,
-        text_scores_by_decision=text_scores,
+        text_scores_by_decision=(
+            text_scores if config.graph_includes_text_score else None
+        ),
     )
     date_positions = {date: index for index, date in enumerate(splits.train_effective)}
     records: list[dict[str, Any]] = []
     graph_reports: list[dict[str, Any]] = []
     for fold in folds:
-        graph_train_dates = _complete_oof_graph_train_dates(graph_data, fold.train_dates)
+        graph_train_dates = (
+            _complete_oof_graph_train_dates(graph_data, fold.train_dates)
+            if config.graph_includes_text_score
+            else fold.train_dates
+        )
         if not graph_train_dates:
             graph_reports.append(
                 {"fold_id": fold.fold_id, "status": "skipped_no_prior_text_oof"}
@@ -199,6 +321,65 @@ def generate_oof_predictions(
                 {"fold_id": fold.fold_id, "status": "skipped_single_class_graph_train"}
             )
             continue
+        selected_epochs = fixed_epochs
+        inner_report: dict[str, Any] | None = None
+        if training_policy == "inner_chronological_early_stop":
+            try:
+                inner = build_inner_chronological_split(
+                    graph_train_dates,
+                    embargo_days=embargo_days,
+                )
+            except ValueError as error:
+                graph_reports.append(
+                    {
+                        "fold_id": fold.fold_id,
+                        "status": "skipped_insufficient_inner_history",
+                        "graph_train_days": len(graph_train_dates),
+                        "reason": str(error),
+                    }
+                )
+                continue
+            inner_train_raw = graph_data.subset(inner.train_dates)
+            inner_validation_raw = graph_data.subset(inner.validation_dates)
+            inner_targets = inner_train_raw.targets[inner_train_raw.label_mask]
+            if len(np.unique(inner_targets)) < 2:
+                graph_reports.append(
+                    {
+                        "fold_id": fold.fold_id,
+                        "status": "skipped_single_class_inner_graph_train",
+                        "graph_train_days": len(graph_train_dates),
+                    }
+                )
+                continue
+            inner_scaler = fit_graph_scaler(
+                inner_train_raw, input_manifest_hash=manifest_hash
+            )
+            inner_train = scale_graph_dataset(inner_train_raw, inner_scaler)
+            inner_validation = scale_graph_dataset(
+                inner_validation_raw, inner_scaler
+            )
+            _, tuning = fit_gat(
+                inner_train,
+                inner_validation,
+                config.graph_model,
+                seed=seed + fold.fold_id * 2 + 1,
+                device=device,
+            )
+            selected_epochs = int(tuning["best_epoch"])
+            inner_report = {
+                "train_start": inner.train_dates[0].isoformat(),
+                "train_end": inner.train_dates[-1].isoformat(),
+                "train_days": len(inner.train_dates),
+                "train_rows": inner_train.supervised_count,
+                "embargo_start": inner.embargo_dates[0].isoformat(),
+                "embargo_end": inner.embargo_dates[-1].isoformat(),
+                "embargo_trading_days": len(inner.embargo_dates),
+                "validation_start": inner.validation_dates[0].isoformat(),
+                "validation_end": inner.validation_dates[-1].isoformat(),
+                "validation_days": len(inner.validation_dates),
+                "validation_rows": inner_validation.supervised_count,
+                "selected_epochs": selected_epochs,
+            }
         scaler = fit_graph_scaler(train_raw, input_manifest_hash=manifest_hash)
         train = scale_graph_dataset(train_raw, scaler)
         prediction = scale_graph_dataset(prediction_raw, scaler)
@@ -208,7 +389,7 @@ def generate_oof_predictions(
             config.graph_model,
             seed=seed + fold.fold_id * 2 + 1,
             device=device,
-            fixed_epochs=fixed_epochs,
+            fixed_epochs=selected_epochs,
         )
         graph_logits, graph_probabilities, alpha, h_graph = predict_gat(
             model,
@@ -221,6 +402,10 @@ def generate_oof_predictions(
             raise RuntimeError(f"OOF GAT did not train in fold {fold.fold_id}")
         model_train_end = graph_train_dates[-1]
         prediction_start = fold.prediction_dates[0]
+        if inner_report is not None and not inner.validation_dates[-1] < prediction_start:
+            raise ValueError(
+                f"Inner Graph validation overlaps outer prediction fold {fold.fold_id}"
+            )
         if date_positions[prediction_start] - date_positions[model_train_end] - 1 < int(
             config.split["embargo_trading_days"]
         ):
@@ -228,9 +413,14 @@ def generate_oof_predictions(
         for day, date in enumerate(prediction.dates):
             for node, symbol in enumerate(prediction.symbols):
                 decision_id = str(prediction.decision_ids[day, node])
-                text_record = text_oof.get(decision_id)
-                if text_record is None or not prediction.label_mask[day, node]:
+                if not prediction.label_mask[day, node]:
                     continue
+                text_record = text_oof.get(decision_id)
+                if text_record is None:
+                    raise ValueError(
+                        "Supervised Graph OOF node is missing its Text OOF record: "
+                        f"{decision_id}"
+                    )
                 records.append(
                     {
                         **text_record,
@@ -243,7 +433,8 @@ def generate_oof_predictions(
                         "h_graph": h_graph[day, node].astype(np.float32).tolist(),
                         "alpha": alpha[day].astype(np.float32).tolist(),
                         "graph_representation_is_oof": True,
-                        "graph_text_score_is_oof": True,
+                        "graph_text_score_is_oof": config.graph_includes_text_score,
+                        "graph_text_score_used": config.graph_includes_text_score,
                         "is_oof": True,
                     }
                 )
@@ -253,14 +444,30 @@ def generate_oof_predictions(
                 "status": "complete",
                 "model_train_start": graph_train_dates[0].isoformat(),
                 "model_train_end": model_train_end.isoformat(),
-                "train_days_with_text_oof": len(graph_train_dates),
+                "graph_train_days": len(graph_train_dates),
+                "graph_train_rows": train.supervised_count,
+                "train_days_with_text_oof": (
+                    len(graph_train_dates) if config.graph_includes_text_score else 0
+                ),
                 "prediction_start": prediction_start.isoformat(),
                 "prediction_end": fold.prediction_dates[-1].isoformat(),
+                "prediction_days": len(prediction.dates),
+                "prediction_rows": int(prediction.label_mask.sum()),
                 "parameters_changed": history["parameter_changed"],
-                "text_score_source": "oof_by_decision_id",
+                "training_policy": training_policy,
+                "epochs": selected_epochs,
+                "inner": inner_report,
+                "text_score_source": (
+                    "oof_by_decision_id"
+                    if config.graph_includes_text_score
+                    else "disabled"
+                ),
             }
         )
     records.sort(key=lambda row: (row["decision_date"], row["symbol"], row["decision_id"]))
+    record_ids = [str(row["decision_id"]) for row in records]
+    if len(record_ids) != len(set(record_ids)):
+        raise ValueError("OOF predictions contain duplicate decision IDs")
     if len(records) < 30 or len({row["target"] for row in records}) < 2:
         raise ValueError("Canonical graph OOF coverage is too small or single-class")
     graph_dim = len(records[0]["h_graph"])
@@ -291,6 +498,7 @@ def generate_oof_predictions(
             ("text_prediction_is_oof", pa.bool_()),
             ("graph_representation_is_oof", pa.bool_()),
             ("graph_text_score_is_oof", pa.bool_()),
+            ("graph_text_score_used", pa.bool_()),
             ("is_oof", pa.bool_()),
         ]
     )
@@ -298,11 +506,18 @@ def generate_oof_predictions(
     _write_parquet(output_path, records, schema)
     stage_access = guard.access_log[access_start:]
     assert_oof_only_access(stage_access)
+    history_threshold_table = minimum_history_coverage_table(
+        records, graph_reports, graph_data.symbols
+    )
     manifest = {
         "artifact": output_path.name,
         "artifact_sha256": sha256_path(output_path),
         "text_folds": text_reports,
         "graph_folds": graph_reports,
+        "training_policy": training_policy,
+        "graph_topology": config.graph_topology,
+        "graph_include_text_score": config.graph_includes_text_score,
+        "ablation_fingerprint": config.ablation_fingerprint,
         "fold_count": len(folds),
         "oof_rows": len(records),
         "eligible_effective_train_rows": len(text_data),
@@ -315,6 +530,9 @@ def generate_oof_predictions(
         "strictly_earlier_models_verified": True,
         "oof_text_for_graph_verified": True,
         "oof_graph_latents_verified": True,
+        "graph_text_score_used": config.graph_includes_text_score,
+        "minimum_history_threshold_applied": False,
+        "minimum_history_coverage_table": history_threshold_table,
         "validation_access_count": sum(
             item["split"].startswith("validation") for item in stage_access
         ),
@@ -325,7 +543,9 @@ def generate_oof_predictions(
         },
         "h_text_dim": 384,
         "h_graph_dim": graph_dim,
-        "fixed_fold_epochs": fixed_epochs,
+        "fixed_fold_epochs": (
+            fixed_epochs if training_policy == "fixed_epochs" else None
+        ),
     }
     if manifest["validation_access_count"] or manifest["test_access_count"]:
         raise ValueError("OOF generation accessed validation or test")
@@ -375,8 +595,10 @@ def generate_validation_base_predictions(
         dates=validation_dates,
         purpose="model_selection",
         guard=guard,
-        text_scores_by_decision=text_scores,
-        require_oof_text_scores=True,
+        text_scores_by_decision=(
+            text_scores if config.graph_includes_text_score else None
+        ),
+        require_oof_text_scores=config.graph_includes_text_score,
     )
     graph_scaler = TrainOnlyScaler.load(config.model_dir / "graph_scaler.json")
     graph = scale_graph_dataset(graph_raw, graph_scaler)
@@ -456,4 +678,8 @@ def generate_validation_base_predictions(
         ),
         "h_text_dim": 384,
         "h_graph_dim": graph_dim,
+        "graph_topology": config.graph_topology,
+        "graph_include_text_score": config.graph_includes_text_score,
+        "graph_feature_names": list(graph.feature_names),
+        "ablation_fingerprint": config.ablation_fingerprint,
     }

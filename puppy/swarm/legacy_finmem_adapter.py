@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,8 +21,23 @@ from puppy.common.schemas import (
 )
 
 
-ADAPTER_VERSION = "legacy-finmem-causal-v1"
+ADAPTER_VERSION = "legacy-finmem-causal-v2"
 REFLECTION_PROMPT_VERSION = "retrospective-v1"
+
+
+class CausalDecisionFailure(RuntimeError):
+    """Sanitized terminal failure for one frozen causal decision."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        response_hash: str,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.response_hash = response_hash
 
 
 def _stable_hash(*parts: Any) -> str:
@@ -67,6 +82,42 @@ class LegacyFinMemAdapter:
         self.decay_count = 0
         self.feedback_count = 0
         self._decision_cache: dict[str, dict[str, Any]] = {}
+        self._decision_stats: Counter[str] = Counter()
+
+    @property
+    def decision_stats(self) -> dict[str, int]:
+        fields = (
+            "total_decisions",
+            "buy_count",
+            "hold_count",
+            "sell_count",
+            "parse_success_count",
+            "retry_count",
+            "cache_hit_count",
+            "api_call_count",
+            "failed_decision_count",
+        )
+        return {field: int(self._decision_stats[field]) for field in fields}
+
+    def record_replayed_decision(self, output: AgentOutput) -> None:
+        """Restore decision accounting without invoking the chat backend."""
+
+        if output.signal.symbol != self.symbol or not output.parse_ok:
+            raise ValueError("Replayed AgentOutput does not belong to this adapter")
+        decision = str(output.signal.decision).lower()
+        if decision not in {"buy", "hold", "sell"}:
+            raise ValueError("Replayed AgentOutput has an invalid decision")
+        provenance = dict(output.metadata.get("causal_provenance", {}))
+        self._decision_stats["total_decisions"] += 1
+        self._decision_stats[f"{decision}_count"] += 1
+        self._decision_stats["parse_success_count"] += 1
+        self._decision_stats["retry_count"] += int(provenance.get("retry_count", 0))
+        self._decision_stats["cache_hit_count"] += int(
+            bool(output.metadata.get("cache_hit", False))
+        )
+        self._decision_stats["api_call_count"] += int(
+            provenance.get("api_call_count", 0)
+        )
 
     def advance_memory_clock(
         self,
@@ -219,29 +270,136 @@ class LegacyFinMemAdapter:
             raw = {"bootstrap": True, "policy": "sha256-context-bucket-v1"}
             model_name = "bootstrap-deterministic-policy-v1"
         else:
+            if run_context.bootstrap:
+                raise RuntimeError("Non-bootstrap adapter cannot run in bootstrap mode")
             causal_decide = getattr(self.llm_agent, "causal_decide", None)
             if causal_decide is None:
                 raise RuntimeError("Non-bootstrap adapter requires llm_agent.causal_decide; LLMAgent.step is forbidden")
             generation_parameters = dict(run_context.metadata.get("generation_parameters", {}))
+            generation_parameters.setdefault("temperature", 0.0)
+            generation_parameters.setdefault("reasoning_effort", "low")
+            model_identity = str(getattr(self.llm_agent, "model_name", "unknown"))
+            backend_identity = str(
+                getattr(self.llm_agent, "backend_identity", "unknown-backend")
+            )
+            backend = getattr(self.llm_agent, "chat_backend", None)
+            backend_provider = str(
+                getattr(backend, "service_provider", "unknown-provider")
+            )
+            backend_interface = str(getattr(backend, "provider", "unknown-interface"))
+            base_url_identity = str(
+                getattr(backend, "base_url_identity", "unknown-base-url")
+            )
+            base_url = str(getattr(backend, "base_url", "unknown-base-url"))
+            schema_version = str(
+                getattr(self.llm_agent, "causal_schema_version", "unknown-schema")
+            )
             cache_key = _stable_hash(
-                getattr(self.llm_agent, "model_name", None),
+                backend_provider,
+                backend_interface,
+                base_url_identity,
+                model_identity,
+                schema_version,
                 run_context.prompt_version,
+                self.symbol,
                 agent_context.context_hash,
                 generation_parameters,
             )
             force_llm = bool(run_context.metadata.get("force_llm", False))
             cache_hit = cache_key in self._decision_cache and not force_llm
+            api_calls_before = int(getattr(backend, "api_call_count", 0))
+            transport_retries_before = int(getattr(backend, "retry_count", 0))
             if cache_hit:
                 raw = dict(self._decision_cache[cache_key])
             else:
-                raw = dict(causal_decide(market_step, agent_context, run_context))
+                try:
+                    raw = dict(causal_decide(market_step, agent_context, run_context))
+                except Exception as exc:
+                    self._decision_stats["failed_decision_count"] += 1
+                    response_hash = str(
+                        getattr(
+                            exc,
+                            "response_hash",
+                            getattr(backend, "last_response_hash", None) or "unavailable",
+                        )
+                    )
+                    category = str(
+                        getattr(exc, "category", "structured_parse_failed")
+                    )
+                    returned_model = str(
+                        getattr(exc, "returned_model", None) or "unknown"
+                    )
+                    raise CausalDecisionFailure(
+                        f"Causal decision failed; symbol={self.symbol}; "
+                        f"date={run_context.current_date.isoformat()}; "
+                        f"category={category}; response_hash={response_hash}; "
+                        f"model={model_identity}; returned_model={returned_model}; "
+                        f"prompt_version={run_context.prompt_version}",
+                        category=category,
+                        response_hash=response_hash,
+                    ) from exc
                 self._decision_cache[cache_key] = dict(raw)
-            decision = str(raw.get("investment_decision", "hold")).lower()
+            original_parse_retries = int(raw.pop("_causal_parse_retries", 0))
+            parse_retries = 0 if cache_hit else original_parse_retries
+            response_hash = str(raw.pop("_causal_response_hash", "unavailable"))
+            causal_provenance = dict(raw.pop("_causal_provenance", {}))
+            eligible_memory_ids = dict(raw.pop("_causal_eligible_memory_ids", {}))
+            eligible_memory_set_hash = str(
+                raw.pop("_causal_eligible_memory_set_hash", "unavailable")
+            )
+            decision_raw = raw.get("investment_decision")
+            decision = decision_raw if isinstance(decision_raw, str) else ""
             if decision not in {"buy", "hold", "sell"}:
-                decision = "hold"
+                self._decision_stats["failed_decision_count"] += 1
+                raise CausalDecisionFailure(
+                    f"Causal decision failed; symbol={self.symbol}; "
+                    f"date={run_context.current_date.isoformat()}; "
+                    "error=invalid_explicit_action; "
+                    f"response_hash={response_hash}; "
+                    f"prompt_version={run_context.prompt_version}",
+                    category="invalid_decision_enum",
+                    response_hash=response_hash,
+                )
             action = {"sell": -1, "hold": 0, "buy": 1}[decision]
             reason = str(raw.get("summary_reason") or "No causal decision reason supplied.")
-            model_name = getattr(self.llm_agent, "model_name", None)
+            model_name = model_identity
+            api_calls = int(getattr(backend, "api_call_count", 0)) - api_calls_before
+            transport_retries = (
+                int(getattr(backend, "retry_count", 0)) - transport_retries_before
+            )
+            self._decision_stats["total_decisions"] += 1
+            self._decision_stats[f"{decision}_count"] += 1
+            self._decision_stats["parse_success_count"] += 1
+            self._decision_stats["retry_count"] += parse_retries + transport_retries
+            self._decision_stats["cache_hit_count"] += int(cache_hit)
+            self._decision_stats["api_call_count"] += max(0, api_calls)
+            causal_provenance.update(
+                {
+                    "provider": causal_provenance.get("provider", backend_provider),
+                    "interface": causal_provenance.get("interface", backend_interface),
+                    "base_url": base_url,
+                    "base_url_identity": base_url_identity,
+                    "requested_model": causal_provenance.get(
+                        "requested_model", model_identity
+                    ),
+                    "returned_model": causal_provenance.get(
+                        "returned_model",
+                        getattr(backend, "last_returned_model", None),
+                    ),
+                    "prompt_version": run_context.prompt_version,
+                    "schema_version": schema_version,
+                    "temperature": generation_parameters["temperature"],
+                    "reasoning_effort": generation_parameters["reasoning_effort"],
+                    "context_hash": agent_context.context_hash,
+                    "response_hash": response_hash,
+                    "retry_count": causal_provenance.get(
+                        "retry_count", parse_retries + transport_retries
+                    ),
+                    "api_call_count": max(0, api_calls),
+                    "cache_hit": cache_hit,
+                    "eligible_memory_set_hash": eligible_memory_set_hash,
+                }
+            )
         return AgentOutput(
             signal=AgentSignal(
                 agent_id=self.agent_id,
@@ -263,6 +421,24 @@ class LegacyFinMemAdapter:
                 "bootstrap": self.bootstrap,
                 "cache_hit": False if self.bootstrap else cache_hit,
                 "generation_parameters": {} if self.bootstrap else generation_parameters,
+                "cache_key": None if self.bootstrap else cache_key,
+                "backend_identity": None if self.bootstrap else backend_identity,
+                "backend_provider": (
+                    None if self.bootstrap else backend_provider
+                ),
+                "backend_interface": None if self.bootstrap else backend_interface,
+                "base_url_identity": None if self.bootstrap else base_url_identity,
+                "schema_version": None if self.bootstrap else schema_version,
+                "eligible_memory_ids": (
+                    {} if self.bootstrap else eligible_memory_ids
+                ),
+                "eligible_memory_set_hash": (
+                    None if self.bootstrap else eligible_memory_set_hash
+                ),
+                "causal_provenance": {} if self.bootstrap else causal_provenance,
+                "synthetic": (
+                    False if self.bootstrap else bool(getattr(backend, "is_mock", False))
+                ),
             },
         )
 

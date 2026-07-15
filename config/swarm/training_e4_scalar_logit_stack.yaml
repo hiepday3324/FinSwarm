@@ -1,0 +1,78 @@
+run:
+  run_id: finswarm_stage6_e4_scalar_logit_stack
+  seed: 42
+
+inputs:
+  experiment_config: config/swarm/experiment_v1.yaml
+  artifact_dir: data/training/finswarm_v1
+  split_manifest: data/manifests/price_split_manifest.json
+
+output:
+  model_dir: data/model_artifacts/ablations/e4_scalar_logit_stack
+
+text_embedding:
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  dimension: 384
+  pooling: mean
+  normalize: true
+  max_length: 512
+  batch_size: 32
+  text_view_version: full-causal-agent-context-v1
+  local_files_only: false
+
+split:
+  embargo_trading_days: 20
+  validation_selection_fraction: 0.6666667
+  oof_folds: 5
+  oof_min_train_days: 60
+
+labels:
+  positive_label: 1
+  negative_label: -1
+  neutral_label: 0
+  mask_neutral: true
+  threshold_bps: 10
+
+graph:
+  topology: full
+  include_text_score: true
+
+fusion:
+  head: scalar_logit_stack
+
+oof:
+  training_policy: fixed_epochs
+
+text_model:
+  baseline: logistic_regression
+  primary: mlp
+  hidden_dim: 128
+  dropout: 0.2
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 64
+  max_epochs: 300
+  patience: 25
+
+graph_model:
+  hidden_dim: 32
+  num_heads: 4
+  dropout: 0.2
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 32
+  max_epochs: 300
+  patience: 25
+  gradient_clip_norm: 1.0
+
+fusion_model:
+  latent_dim: 32
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 64
+  max_epochs: 300
+  patience: 25
+
+calibration:
+  method: temperature

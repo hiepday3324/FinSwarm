@@ -446,7 +446,9 @@ def _validate_at_root(config_path: Path, artifact_dir: Path) -> dict:
     expected = config_path.parents[2] / "data/training/finswarm_v1"
     if expected != artifact_dir:
         raise AssertionError("Synthetic artifact root must match production layout")
-    return validate_training_artifacts(str(config_path), "finswarm_v1")
+    return validate_training_artifacts(
+        str(config_path), "finswarm_v1", require_final=False
+    )
 
 
 if __name__ == "__main__":

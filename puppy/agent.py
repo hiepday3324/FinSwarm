@@ -3,6 +3,7 @@ import shutil
 import pickle
 import logging
 import json
+import hashlib
 from datetime import date
 from .run_type import RunMode
 from .memorydb import BrainDB
@@ -11,8 +12,50 @@ from abc import ABC, abstractmethod
 from .chat import ChatOpenAICompatible
 from .environment import market_info_type
 from typing import Dict, Union, Any, List
-from .reflection import trading_reflection
+from .reflection import CAUSAL_DECISION_SCHEMA_VERSION, trading_reflection
 from transformers import AutoTokenizer
+
+
+def causal_memory_inputs(agent_context: Any) -> tuple[dict[str, list[str]], dict[str, list[int]]]:
+    short_memory = list(agent_context.short_memory)
+    if agent_context.shadow_state is not None:
+        short_memory.append(
+            "Prior ShadowPortfolio state: "
+            + json.dumps(agent_context.shadow_state, sort_keys=True, default=str)
+        )
+    if agent_context.psychology_state is not None:
+        short_memory.append(
+            "Prior Psychology state: "
+            + json.dumps(agent_context.psychology_state, sort_keys=True, default=str)
+        )
+    for shared in agent_context.shared_context:
+        short_memory.append(
+            "Causally eligible shared context with provenance: "
+            + json.dumps(shared.model_dump(mode="json"), sort_keys=True, default=str)
+        )
+
+    memories = {
+        "short": short_memory,
+        "middle": list(agent_context.mid_memory),
+        "long": list(agent_context.long_memory),
+        "reflection": list(agent_context.reflection_memory),
+    }
+    offsets = {"short": 100000, "middle": 200000, "long": 300000, "reflection": 400000}
+    eligible = {
+        layer: [offsets[layer] + index for index in range(len(values))]
+        for layer, values in memories.items()
+    }
+    return memories, eligible
+
+
+def causal_eligible_memory_set_hash(eligible_memory_ids: dict[str, list[int]]) -> str:
+    payload = json.dumps(
+        eligible_memory_ids,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class TextTruncator:
@@ -95,6 +138,8 @@ class LLMAgent(Agent):
         chat_config: Dict[str, Any],
         top_k: int = 1,
         look_back_window_size: int = 7,
+        chat_backend: Any | None = None,
+        logger: logging.Logger | None = None,
     ):
         # base
         self.counter = 1
@@ -104,22 +149,25 @@ class LLMAgent(Agent):
         self.character_string = character_string
         self.look_back_window_size = look_back_window_size
         # logger
-        self.logger = logging.getLogger(__name__)
+        self.logger = logger or logging.getLogger(
+            f"{__name__}.{self.agent_name}.{self.trading_symbol}"
+        )
         self.logger.setLevel(logging.INFO)
-        logging_formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        file_handler = logging.FileHandler(
-            os.path.join(
-                "data",
-                "04_model_output_log",
-                f"{self.trading_symbol}_run.log",
-            ),
-            mode="a",
-        )
-        file_handler.setFormatter(logging_formatter)
-        self.logger.addHandler(file_handler)
+        if logger is None and not self.logger.handlers:
+            logging_formatter = logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            file_handler = logging.FileHandler(
+                os.path.join(
+                    "data",
+                    "04_model_output_log",
+                    f"{self.trading_symbol}_run.log",
+                ),
+                mode="a",
+            )
+            file_handler.setFormatter(logging_formatter)
+            self.logger.addHandler(file_handler)
         # brain db
         self.brain = brain_db
         # portfolio class
@@ -128,41 +176,73 @@ class LLMAgent(Agent):
         )
         self.chat_config_save = chat_config.copy()
         chat_config = chat_config.copy()
-        end_point = chat_config["end_point"]
-        model = chat_config["model"]
-        system_message = chat_config["system_message"]# truncator
-        self.model_name = chat_config["model"]
+        end_point = chat_config.pop("end_point")
+        model = chat_config.pop("model")
+        system_message = chat_config.pop("system_message")
+        self.model_name = str(getattr(chat_backend, "model", model))
         self.max_token_short = chat_config.get("max_token_short", None)
         self.max_token_mid = chat_config.get("max_token_mid", None)
         self.max_token_long = chat_config.get("max_token_long", None)
         self.max_token_reflection = chat_config.get("max_token_reflection", None)
-        del chat_config["end_point"]
-        del chat_config["model"]
-        del chat_config["system_message"]
         if self.max_token_short:
             self.truncator = TextTruncator(
                 tokenization_model_name=chat_config["tokenization_model_name"]
             )
-        self.guardrail_endpoint = ChatOpenAICompatible(
+        generation_parameters = {
+            key: value
+            for key, value in chat_config.items()
+            if key
+            not in {
+                "tokenization_model_name",
+                "max_token_short",
+                "max_token_mid",
+                "max_token_long",
+                "max_token_reflection",
+            }
+        }
+        self.chat_backend = chat_backend or ChatOpenAICompatible(
             end_point=end_point,
             model=model,
             system_message=system_message,
-            other_parameters=chat_config,
-        ).guardrail_endpoint()
+            other_parameters=generation_parameters,
+        )
+        self.backend_identity = str(
+            getattr(self.chat_backend, "identity", type(self.chat_backend).__name__)
+        )
+        self.causal_schema_version = CAUSAL_DECISION_SCHEMA_VERSION
+        self.guardrail_endpoint = self.chat_backend.guardrail_endpoint()
         # records
         self.reflection_result_series_dict = {}
         self.access_counter = {}
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "LLMAgent":
+    def from_config(
+        cls,
+        config: Dict[str, Any],
+        *,
+        brain_db: BrainDB | None = None,
+        chat_backend: Any | None = None,
+        memory_embedding_backend: Any | None = None,
+        logger: logging.Logger | None = None,
+    ) -> "LLMAgent":
         return cls(
             agent_name=config["general"]["agent_name"],
             trading_symbol=config["general"]["trading_symbol"],
             character_string=config["general"]["character_string"],
-            brain_db=BrainDB.from_config(config=config),
+            brain_db=(
+                brain_db
+                if brain_db is not None
+                else BrainDB.from_config(
+                    config=config,
+                    embedding_backend=memory_embedding_backend,
+                    logger=logger,
+                )
+            ),
             top_k=config["general"].get("top_k", 5),
             chat_config=config["chat"],
             look_back_window_size=config["general"]["look_back_window_size"],
+            chat_backend=chat_backend,
+            logger=logger,
         )
 
     def causal_decide(
@@ -177,27 +257,8 @@ class LLMAgent(Agent):
             raise ValueError("Causal decision inputs must share the decision date")
         if market_step.as_of != run_context.current_cutoff:
             raise ValueError("Causal decision cutoff mismatch")
-        short_memory = list(agent_context.short_memory)
-        if agent_context.shadow_state is not None:
-            short_memory.append(
-                "Prior ShadowPortfolio state: "
-                + json.dumps(agent_context.shadow_state, sort_keys=True, default=str)
-            )
-        if agent_context.psychology_state is not None:
-            short_memory.append(
-                "Prior Psychology state: "
-                + json.dumps(agent_context.psychology_state, sort_keys=True, default=str)
-            )
-        for shared in agent_context.shared_context:
-            short_memory.append(
-                "Causally eligible shared context with provenance: "
-                + json.dumps(shared.model_dump(mode="json"), sort_keys=True, default=str)
-            )
-
-        def ids(values: List[str], offset: int) -> List[int]:
-            return [offset + index for index in range(len(values))]
-
-        return trading_reflection(
+        memories, eligible = causal_memory_inputs(agent_context)
+        result = trading_reflection(
             cur_date=market_step.date,
             endpoint_func=self.guardrail_endpoint,
             symbol=self.trading_symbol,
@@ -205,15 +266,30 @@ class LLMAgent(Agent):
             logger=self.logger,
             momentum=None,
             future_record=None,
-            short_memory=short_memory,
-            short_memory_id=ids(short_memory, 100000),
-            mid_memory=list(agent_context.mid_memory),
-            mid_memory_id=ids(list(agent_context.mid_memory), 200000),
-            long_memory=list(agent_context.long_memory),
-            long_memory_id=ids(list(agent_context.long_memory), 300000),
-            reflection_memory=list(agent_context.reflection_memory),
-            reflection_memory_id=ids(list(agent_context.reflection_memory), 400000),
+            short_memory=memories["short"],
+            short_memory_id=eligible["short"],
+            mid_memory=memories["middle"],
+            mid_memory_id=eligible["middle"],
+            long_memory=memories["long"],
+            long_memory_id=eligible["long"],
+            reflection_memory=memories["reflection"],
+            reflection_memory_id=eligible["reflection"],
+            strict_output=True,
+            structured_endpoint=getattr(
+                self.chat_backend, "structured_completion", None
+            ),
+            requested_model=self.model_name,
+            prompt_version=run_context.prompt_version,
+            provider=str(
+                getattr(self.chat_backend, "service_provider", "unknown")
+            ),
+            interface=str(getattr(self.chat_backend, "provider", "unknown")),
         )
+        result["_causal_eligible_memory_ids"] = eligible
+        result["_causal_eligible_memory_set_hash"] = causal_eligible_memory_set_hash(
+            eligible
+        )
+        return result
 
     def _handling_filings(self, cur_date: date, filing_q: str, filing_k: str) -> None:
         if filing_q:
