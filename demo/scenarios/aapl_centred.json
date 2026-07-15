@@ -1,0 +1,30 @@
+{
+  "agent_actions": {
+    "AAPL": "hold",
+    "NVDA": "hold",
+    "TSLA": "hold"
+  },
+  "allocation_weight_dispersion": 0.45,
+  "attention_shift": 0.2430296391248703,
+  "central_symbol": "AAPL",
+  "date": "2024-11-19",
+  "date_index": 52,
+  "fusion_probability_separation": 0.009766608476638794,
+  "main_headline": "S&P 500 To Reach 6,500 By End Of 2025, Analysts Predict: Could It Spark M&A Revival?",
+  "score": 2.434681412577629,
+  "selection_basis": [
+    "direct causal news provenance",
+    "stored Agent context and output",
+    "sample-specific mean attention shift",
+    "fusion probability separation",
+    "rule-based allocation dispersion"
+  ],
+  "selection_excluded_fields": [
+    "outcomes",
+    "targets",
+    "prediction correctness",
+    "validation metrics",
+    "test metrics"
+  ],
+  "why_visually_informative": "AAPL has 7 directly routed news item(s); the largest connected mean-attention shift is 0.243, while Fusion probabilities span 0.010."
+}

@@ -1,0 +1,30 @@
+{
+  "agent_actions": {
+    "AAPL": "hold",
+    "NVDA": "hold",
+    "TSLA": "hold"
+  },
+  "allocation_weight_dispersion": 0.45,
+  "attention_shift": 0.2034870982170105,
+  "central_symbol": "TSLA",
+  "date": "2025-06-23",
+  "date_index": 197,
+  "fusion_probability_separation": 0.01210099458694458,
+  "main_headline": "3 Reasons Bitcoin's Momentum Could Continue Into 2026 and Beyond",
+  "score": 2.2416374802589414,
+  "selection_basis": [
+    "direct causal news provenance",
+    "stored Agent context and output",
+    "sample-specific mean attention shift",
+    "fusion probability separation",
+    "rule-based allocation dispersion"
+  ],
+  "selection_excluded_fields": [
+    "outcomes",
+    "targets",
+    "prediction correctness",
+    "validation metrics",
+    "test metrics"
+  ],
+  "why_visually_informative": "TSLA has 6 directly routed news item(s); the largest connected mean-attention shift is 0.203, while Fusion probabilities span 0.012."
+}

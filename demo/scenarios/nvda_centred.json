@@ -1,0 +1,30 @@
+{
+  "agent_actions": {
+    "AAPL": "hold",
+    "NVDA": "buy",
+    "TSLA": "hold"
+  },
+  "allocation_weight_dispersion": 0.45,
+  "attention_shift": 0.23705339431762695,
+  "central_symbol": "NVDA",
+  "date": "2025-05-09",
+  "date_index": 168,
+  "fusion_probability_separation": 0.01097196340560913,
+  "main_headline": "Taiwan Semiconductor Has a New Reason to Rally on Chip Curbs",
+  "score": 2.4072108983993528,
+  "selection_basis": [
+    "direct causal news provenance",
+    "stored Agent context and output",
+    "sample-specific mean attention shift",
+    "fusion probability separation",
+    "rule-based allocation dispersion"
+  ],
+  "selection_excluded_fields": [
+    "outcomes",
+    "targets",
+    "prediction correctness",
+    "validation metrics",
+    "test metrics"
+  ],
+  "why_visually_informative": "NVDA has 7 directly routed news item(s); the largest connected mean-attention shift is 0.237, while Fusion probabilities span 0.011."
+}
