@@ -13,17 +13,16 @@ import torch
 
 from puppy.common.schemas import (
     AgentContext,
+    AllocationWeights,
     CausalRunContext,
     GraphOutput,
     MarketStep,
     PriceBar,
+    PortfolioSnapshot,
     SharedContext,
-    ShadowPortfolioState,
 )
 from puppy.debate.coordinator import DebateCoordinator
 from puppy.memory_ext.memory_sharing import MemorySharingService
-from puppy.portfolio_ext.allocation_engine import fusion_to_target_weights
-from puppy.portfolio_ext.execution_policy import target_weights_to_trades
 from puppy.portfolio_ext.master_portfolio import MasterPortfolio
 from puppy.fusion.gated_fusion import LatentGatedFusion
 from puppy.fusion.text_encoder import TextStreamEncoder
@@ -33,8 +32,8 @@ from puppy.graph.graph_dataset import CANONICAL_FEATURE_NAMES, build_causal_grap
 from puppy.graph.graph_features import (
     ACTION_FEATURE_NAMES,
     MARKET_FEATURE_NAMES,
+    MASTER_PORTFOLIO_FEATURE_NAMES,
     PSYCHOLOGY_FEATURE_NAMES,
-    SHADOW_FEATURE_NAMES,
     TEXT_SCORE_FEATURE_NAMES,
 )
 from puppy.graph.risk_router import build_memory_share_routes
@@ -54,6 +53,7 @@ from puppy.training.text_embedding import sha256_path
 
 class _Observed:
     date = dt.date(2025, 1, 3)
+    as_of = dt.datetime(2025, 1, 3, 21, 10, tzinfo=dt.timezone.utc)
     symbols = ["TSLA", "NVDA"]
     features = {
         "TSLA": {
@@ -103,14 +103,21 @@ def _context() -> AgentContext:
                 created_at=dt.date(2025, 1, 2),
             )
         ],
-        shadow_state={
-            "roi": 0.1,
+        master_portfolio_state={
+            "date": "2025-01-02",
+            "cash": 50000.0,
+            "cash_weight": 0.5,
+            "positions": {"TSLA": 300.0},
+            "weights": {"TSLA": 0.3, "NVDA": 0.2},
+            "equity": 100000.0,
+            "daily_return": 0.01,
+            "cumulative_return": 0.1,
             "rolling_return": 0.08,
             "sharpe": 1.2,
             "drawdown": -0.03,
             "win_rate": 0.6,
         },
-        psychology_state={"state": "greed", "source": "shadow_portfolio"},
+        psychology_state={"state": "greed", "source": "master_portfolio"},
         metadata={"built_before_decision": True},
     )
 
@@ -128,7 +135,7 @@ class CanonicalTextContractTest(unittest.TestCase):
             "deep memory",
             "eligible retrospective reflection",
             "eligible shared memory",
-            '"roi": 0.1',
+            '"cumulative_return": 0.1',
             '"state": "greed"',
             "sector_nvda",
             "cross-sector provenance",
@@ -171,27 +178,27 @@ class CanonicalTextContractTest(unittest.TestCase):
 
 class CanonicalGraphContractTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.shadow = {
-            symbol: ShadowPortfolioState(
-                date=dt.date(2025, 1, 2),
-                agent_id=f"sector_{symbol.lower()}",
-                symbol=symbol,
-                value=1.1,
-                roi=0.1,
-                rolling_return=0.08,
-                sharpe=1.2,
-                drawdown=-0.03,
-                win_rate=0.6,
-            )
-            for symbol in _Observed.symbols
-        }
+        self.master = PortfolioSnapshot(
+            date=dt.date(2025, 1, 2),
+            cash=50000.0,
+            cash_weight=0.5,
+            positions={"TSLA": 300.0, "NVDA": 200.0},
+            weights={"TSLA": 0.3, "NVDA": 0.2},
+            equity=100000.0,
+            daily_return=0.01,
+            cumulative_return=0.1,
+            rolling_return=0.08,
+            sharpe=1.2,
+            drawdown=-0.03,
+            win_rate=0.6,
+        )
 
     def _sample(self):
         return build_causal_graph_sample(
             _Observed(),
             action_signals={"TSLA": 1, "NVDA": -1},
             text_scores={"TSLA": 0.7, "NVDA": 0.3},
-            shadow_states=self.shadow,
+            master_portfolio_state=self.master,
             psychology_states={
                 "TSLA": {"state": "greed"},
                 "NVDA": {"state": "fear"},
@@ -204,18 +211,20 @@ class CanonicalGraphContractTest(unittest.TestCase):
             MARKET_FEATURE_NAMES
             + ACTION_FEATURE_NAMES
             + TEXT_SCORE_FEATURE_NAMES
-            + SHADOW_FEATURE_NAMES
+            + MASTER_PORTFOLIO_FEATURE_NAMES
             + PSYCHOLOGY_FEATURE_NAMES
         )
         self.assertEqual(CANONICAL_FEATURE_NAMES, expected)
         self.assertEqual(self._sample()["metadata"]["feature_names"], list(expected))
 
-    def test_h0_contains_action_text_shadow_and_psychology(self) -> None:
+    def test_h0_contains_action_text_master_portfolio_and_psychology(self) -> None:
         sample = self._sample()
         tsla = sample["node_features"]["TSLA"]
         self.assertEqual(tsla["action_signal"], 1)
         self.assertEqual(tsla["text_score"], 0.7)
-        self.assertEqual(tsla["shadow_roi_prior"], 0.1)
+        self.assertEqual(tsla["master_symbol_weight_prior"], 0.3)
+        self.assertEqual(tsla["master_cash_weight_prior"], 0.5)
+        self.assertEqual(tsla["master_cumulative_return_prior"], 0.1)
         self.assertEqual(tsla["psychology_greed"], 1.0)
         self.assertEqual(tsla["psychology_fear"], 0.0)
 
@@ -404,7 +413,7 @@ class CanonicalMemoryAndGateTest(unittest.TestCase):
         for module in (
             "scripts.run_milestone_1_mock",
             "scripts.run_milestone_3_agents",
-            "scripts.run_milestone_4_shadow",
+            "scripts.run_milestone_4_master_portfolio",
             "scripts.run_milestone_5_graph",
             "scripts.run_milestone_5_memory_sharing",
             "scripts.run_milestone_6_fusion",
@@ -494,7 +503,7 @@ class CanonicalRuntimeIntegrationTest(unittest.TestCase):
         )
         encoder = TextStreamEncoder(
             embedding_func=lambda text: np.asarray(
-                [len(text) / 1000.0, text.count("memory"), text.count("Shadow"), text.count("Psychology")],
+                [len(text) / 1000.0, text.count("memory"), text.count("Master"), text.count("Psychology")],
                 dtype=np.float32,
             ),
             embedding_model="synthetic-canonical",
@@ -533,8 +542,18 @@ class CanonicalRuntimeIntegrationTest(unittest.TestCase):
             )
             agents = {}
             bundles = {}
-            shadow_states = {}
             psychology_states = {}
+            portfolio = MasterPortfolio(initial_cash=100000.0)
+            prior_snapshot = portfolio.apply_target_weights(
+                date=dt.date(2025, 1, 2),
+                prices={symbol: 100.0 for symbol in _Observed.symbols},
+                target_weights=AllocationWeights(
+                    date=dt.date(2025, 1, 2),
+                    weights={"TSLA": 0.3, "NVDA": 0.2},
+                    cash_weight=0.5,
+                ),
+                as_of=dt.datetime(2025, 1, 2, 21, 10, tzinfo=dt.timezone.utc),
+            )
             orchestrator = CausalOrchestrator(
                 models.text_encoder,
                 models.text_score_head,
@@ -557,21 +576,11 @@ class CanonicalRuntimeIntegrationTest(unittest.TestCase):
                         llm, agent_id, symbol, bootstrap=False
                     ),
                 )
-                state = ShadowPortfolioState(
-                    date=dt.date(2025, 1, 2),
-                    agent_id=agent_id,
+                psychology = build_psychology_state(
+                    prior_snapshot,
                     symbol=symbol,
-                    value=1.05,
-                    roi=0.05,
-                    rolling_return=0.04,
-                    sharpe=1.0,
-                    drawdown=-0.02,
-                    win_rate=0.6,
-                    last_resolved_decision_date=dt.date(2025, 1, 1),
                 )
-                psychology = build_psychology_state(state)
                 agents[symbol] = agent
-                shadow_states[symbol] = state
                 psychology_states[symbol] = psychology
                 bundles[symbol] = orchestrator.decide(
                     agent=agent,
@@ -579,22 +588,26 @@ class CanonicalRuntimeIntegrationTest(unittest.TestCase):
                     run_context=run_context,
                     expected_outcome_date=dt.date(2025, 1, 6),
                     split="validation",
-                    shadow_state=state,
+                    master_portfolio_state=prior_snapshot,
                     psychology_state=psychology,
                 )
 
             streams = orchestrator.run_canonical_streams(
                 bundles_by_symbol=bundles,
                 observed_table=_Observed(),
-                shadow_states=shadow_states,
+                master_portfolio_state=prior_snapshot,
                 psychology_states=psychology_states,
                 gat_model=models.gat,
                 fusion_model=models.fusion,
                 graph_scaler=models.graph_scaler,
                 return_history={"TSLA": [0.1, 0.2], "NVDA": [-0.1, -0.2]},
+                master_portfolio=portfolio,
+                prices=step.prices,
             )
             self.assertTrue(streams.graph_output.graph_embeddings)
             self.assertTrue(streams.fusion_output.final_embeddings)
+            self.assertIsNotNone(streams.allocation)
+            self.assertIsNotNone(streams.portfolio_snapshot)
 
             routes = build_memory_share_routes(
                 streams.graph_output,
@@ -634,17 +647,8 @@ class CanonicalRuntimeIntegrationTest(unittest.TestCase):
                 agents,
             )
             self.assertIsInstance(verdicts, list)
-            allocation = fusion_to_target_weights(streams.fusion_output)
-            portfolio = MasterPortfolio(initial_cash=100000.0)
-            trades = target_weights_to_trades(
-                portfolio.equity(step.prices),
-                portfolio.positions,
-                step.prices,
-                allocation,
-            )
-            snapshot = portfolio.apply_allocation_weights(allocation, step.prices, date)
-            self.assertEqual(set(trades), set(_Observed.symbols))
-            self.assertGreater(snapshot.equity, 0.0)
+            self.assertEqual(set(streams.allocation.weights), set(_Observed.symbols))
+            self.assertGreater(streams.portfolio_snapshot.equity, 0.0)
 
 
 if __name__ == "__main__":

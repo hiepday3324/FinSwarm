@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from puppy.common.schemas import GraphOutput, QuantFeatureTable, ShadowPortfolioState, TextFeature
+from puppy.common.schemas import GraphOutput, PortfolioSnapshot, QuantFeatureTable, TextFeature
 from puppy.graph.gat_model import NumpyGATScorer
 from puppy.graph.graph_builder import build_gat_graph_output
 from puppy.graph.graph_dataset import build_graph_sample
@@ -15,7 +15,7 @@ class GATMvpTest(unittest.TestCase):
     def test_build_graph_sample_shape(self) -> None:
         sample = build_graph_sample(
             quant_table=_quant_table(),
-            shadow_states=_shadow_states(),
+            master_portfolio_state=_master_portfolio_state(),
             text_features=_text_features(),
             return_history=_return_history(),
         )
@@ -28,7 +28,7 @@ class GATMvpTest(unittest.TestCase):
     def test_gat_forward_is_deterministic_and_bounded(self) -> None:
         sample = build_graph_sample(
             quant_table=_quant_table(),
-            shadow_states=_shadow_states(),
+            master_portfolio_state=_master_portfolio_state(),
             text_features=_text_features(),
             return_history=_return_history(),
         )
@@ -44,7 +44,7 @@ class GATMvpTest(unittest.TestCase):
         self.assertTrue(np.all(np.diag(model_a.last_attention) == 0.0))
 
     def test_gat_save_and_load_preserve_scores(self) -> None:
-        sample = build_graph_sample(_quant_table(), _shadow_states(), _text_features(), _return_history())
+        sample = build_graph_sample(_quant_table(), _master_portfolio_state(), _text_features(), _return_history())
         model = NumpyGATScorer(input_dim=sample["feature_matrix"].shape[1], seed=5)
         expected = model.forward(sample["feature_matrix"], sample["adjacency_matrix"])
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -58,7 +58,7 @@ class GATMvpTest(unittest.TestCase):
         output = build_gat_graph_output(
             date=dt.date(2026, 1, 8),
             quant_table=_quant_table(),
-            shadow_states=_shadow_states(),
+            master_portfolio_state=_master_portfolio_state(),
             text_features=_text_features(),
             return_history=_return_history(),
         )
@@ -70,7 +70,7 @@ class GATMvpTest(unittest.TestCase):
         self.assertTrue(all(-1.0 <= value <= 1.0 for value in output.graph_scores.values()))
 
     def test_train_gat_mvp_forward_metrics(self) -> None:
-        sample = build_graph_sample(_quant_table(), _shadow_states(), _text_features(), _return_history())
+        sample = build_graph_sample(_quant_table(), _master_portfolio_state(), _text_features(), _return_history())
         model, metrics = train_gat_mvp([sample])
 
         self.assertIsInstance(model, NumpyGATScorer)
@@ -92,12 +92,18 @@ def _quant_table() -> QuantFeatureTable:
     )
 
 
-def _shadow_states() -> list[ShadowPortfolioState]:
-    return [
-        ShadowPortfolioState(date=dt.date(2026, 1, 8), agent_id="sector_tsla", symbol="TSLA", value=1.02, roi=0.02),
-        ShadowPortfolioState(date=dt.date(2026, 1, 8), agent_id="sector_nvda", symbol="NVDA", value=1.01, roi=0.01),
-        ShadowPortfolioState(date=dt.date(2026, 1, 8), agent_id="sector_aapl", symbol="AAPL", value=0.99, roi=-0.01),
-    ]
+def _master_portfolio_state() -> PortfolioSnapshot:
+    return PortfolioSnapshot(
+        date=dt.date(2026, 1, 7),
+        cash=25000.0,
+        cash_weight=0.25,
+        positions={"TSLA": 300.0, "NVDA": 100.0, "AAPL": 250.0},
+        weights={"TSLA": 0.30, "NVDA": 0.20, "AAPL": 0.25},
+        equity=100000.0,
+        daily_return=0.01,
+        cumulative_return=0.02,
+        drawdown=-0.01,
+    )
 
 
 def _text_features() -> list[TextFeature]:

@@ -76,13 +76,14 @@ def run_smoke_test(
     bundle_dir: str | Path = DEFAULT_BUNDLE_DIR,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
 ) -> dict[str, Any]:
-    config = load_demo_config(config_path)
     store = ReplayStore(bundle_dir)
+    config = None if store.manifest.get("mock_bundle") else load_demo_config(config_path)
     engine = FrozenReplayEngine(bundle_dir, device="cpu")
     metadata = store.training_metadata
     manifest = store.manifest
 
-    assert config.training.model_dir.resolve() == Path(bundle_dir).resolve()
+    if config is not None:
+        assert config.training.model_dir.resolve() == Path(bundle_dir).resolve()
     assert metadata["demo_only"] is True
     assert metadata["intentionally_in_sample"] is True
     assert metadata["evaluation_mode"] == "train_replay"
@@ -114,6 +115,7 @@ def run_smoke_test(
     assert metadata["save_load_prediction_equivalence"]["all_passed"] is True
 
     assert tuple(manifest["node_order"]) == NODE_ORDER
+    assert "prior_master_portfolio_features" in store.feature_schema["feature_blocks"]
     assert tuple(store.symbols) == NODE_ORDER
     assert tuple(metadata["node_order"]) == NODE_ORDER
     assert metadata["attention_convention"] == ATTENTION_CONVENTION
@@ -132,6 +134,10 @@ def run_smoke_test(
     for date_index, date in enumerate(store.dates):
         records = store.records_for_date(date)
         assert tuple(row["symbol"] for row in records) == DISPLAY_ORDER
+        for row in records:
+            state = row["master_portfolio_state"]
+            if state is not None:
+                assert str(state["date"]) < date.isoformat()
         expected = store.index["decision_ids_by_date"][date.isoformat()]
         assert engine.decision_ids[date_index].astype(str).tolist() == expected
 

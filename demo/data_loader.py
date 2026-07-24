@@ -69,7 +69,10 @@ class ReplayStore:
             enriched["memory_refs"] = _json(row["memory_refs_json"], [])
             enriched["news_event_ids"] = _json(row["news_event_ids_json"], [])
             enriched["psychology_state"] = _json(row["psychology_state_json"], None)
-            enriched["shadow_state"] = _json(row["shadow_state_json"], None)
+            enriched["master_portfolio_state"] = _json(
+                row["master_portfolio_state_json"],
+                None,
+            )
             enriched["raw_agent_output"] = _json(row["raw_agent_output_json"], {})
             enriched["causal_provenance"] = _json(
                 row["causal_provenance_json"], {}

@@ -12,7 +12,7 @@ def build_agent_context(
     query_text: str | None = None,
     top_k: int | None = None,
     latest_reason: str | None = None,
-    shadow_state: dict[str, Any] | None = None,
+    master_portfolio_state: dict[str, Any] | None = None,
     psychology_state: dict[str, Any] | None = None,
 ) -> AgentContext:
     top_k = top_k if top_k is not None else getattr(sector_agent.llm_agent, "top_k", 3)
@@ -47,7 +47,7 @@ def build_agent_context(
                 if item.created_at is None or item.created_at < cur_date
             ]
         ),
-        shadow_state=shadow_state,
+        master_portfolio_state=master_portfolio_state,
         psychology_state=psychology_state,
     )
 
@@ -87,8 +87,13 @@ def build_raw_context(context: AgentContext) -> str:
             f"Content: {item.text}"
         )
     sections.append(_format_text_list("Shared context", shared_text))
-    if context.shadow_state is not None:
-        sections.append(_format_structured("Shadow state", context.shadow_state))
+    if context.master_portfolio_state is not None:
+        sections.append(
+            _format_structured(
+                "Master portfolio state",
+                context.master_portfolio_state,
+            )
+        )
     if context.psychology_state is not None:
         sections.append(_format_structured("Psychology state", context.psychology_state))
     return "\n\n".join(sections)

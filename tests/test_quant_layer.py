@@ -10,9 +10,9 @@ from puppy.quant.return_utils import (
     compute_simple_return,
 )
 from puppy.quant.risk_rules import apply_basic_risk_rules
-from puppy.quant.shadow_metrics import (
+from puppy.quant.portfolio_metrics import (
     compute_drawdown,
-    compute_roi,
+    compute_return,
     compute_rolling_return,
     compute_sharpe,
     compute_win_rate,
@@ -62,8 +62,8 @@ class QuantLayerTest(unittest.TestCase):
         self.assertAlmostEqual(table.returns["TSLA"], 0.05)
         self.assertEqual(table.labels["TSLA"], 1)
 
-    def test_shadow_metrics_and_risk_rules(self) -> None:
-        self.assertAlmostEqual(compute_roi(110.0, 100.0), 0.1)
+    def test_portfolio_metrics_and_risk_rules(self) -> None:
+        self.assertAlmostEqual(compute_return(110.0, 100.0), 0.1)
         self.assertLess(compute_drawdown([100.0, 90.0, 95.0]), 0.0)
         self.assertAlmostEqual(compute_rolling_return([0.1, -0.1]), -0.01)
         self.assertGreaterEqual(compute_sharpe([0.01, 0.02, -0.01]), 0.0)

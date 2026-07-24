@@ -31,7 +31,6 @@ from .schemas import (
     QuantFeatureTable,
     ReflectionUpdate,
     SharedContext,
-    ShadowPortfolioState,
     TextFeature,
 )
 
@@ -66,6 +65,5 @@ __all__ = [
     "QuantFeatureTable",
     "ReflectionUpdate",
     "SharedContext",
-    "ShadowPortfolioState",
     "TextFeature",
 ]

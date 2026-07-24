@@ -5,13 +5,13 @@
     "TSLA": "hold"
   },
   "allocation_weight_dispersion": 0.45,
-  "attention_shift": 0.2034870982170105,
+  "attention_shift": 0.08304506540298462,
   "central_symbol": "TSLA",
-  "date": "2025-06-23",
-  "date_index": 197,
-  "fusion_probability_separation": 0.01210099458694458,
-  "main_headline": "3 Reasons Bitcoin's Momentum Could Continue Into 2026 and Beyond",
-  "score": 2.2416374802589414,
+  "date": "2024-11-21",
+  "date_index": 54,
+  "fusion_probability_separation": 0.031175434589385986,
+  "main_headline": "TSLA mock market update for 2024-11-21",
+  "score": 1.277576196193695,
   "selection_basis": [
     "direct causal news provenance",
     "stored Agent context and output",
@@ -26,5 +26,5 @@
     "validation metrics",
     "test metrics"
   ],
-  "why_visually_informative": "TSLA has 6 directly routed news item(s); the largest connected mean-attention shift is 0.203, while Fusion probabilities span 0.012."
+  "why_visually_informative": "TSLA has 1 directly routed news item(s); the largest connected mean-attention shift is 0.083, while Fusion probabilities span 0.031."
 }

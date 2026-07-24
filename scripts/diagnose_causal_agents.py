@@ -104,7 +104,6 @@ def _causal_diagnostics(
             run_context=run_context,
             expected_outcome_date=expected_outcome_date,
             split="diagnostic",
-            shadow_state=None,
             psychology_state=build_psychology_state(None),
         )
         provenance = dict(result.output.metadata.get("causal_provenance", {}))

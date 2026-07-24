@@ -19,7 +19,6 @@ from puppy.common.schemas import (
     MemoryShareEvent,
     MemoryShareRoute,
     PortfolioSnapshot,
-    ShadowPortfolioState,
     TextFeature,
 )
 
@@ -83,16 +82,6 @@ class EventStore:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.append_event("TextFeature", date, text_feature, metadata=metadata)
-
-    def append_shadow_portfolio_state(
-        self,
-        date: dt.date | str,
-        shadow_state: ShadowPortfolioState,
-        metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return self.append_event(
-            "ShadowPortfolioState", date, shadow_state, metadata=metadata
-        )
 
     def append_graph_output(
         self,

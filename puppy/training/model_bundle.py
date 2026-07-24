@@ -234,11 +234,11 @@ def _metrics_and_audit(
             name in feature_schema.get("feature_names", [])
             for name in (
                 "action_signal",
-                "shadow_roi_prior",
-                "shadow_rolling_return_prior",
-                "shadow_drawdown_prior",
-                "shadow_sharpe_prior",
-                "shadow_win_rate_prior",
+                "master_symbol_weight_prior",
+                "master_cash_weight_prior",
+                "master_daily_return_prior",
+                "master_cumulative_return_prior",
+                "master_drawdown_prior",
                 "psychology_greed",
                 "psychology_fear",
                 "psychology_neutral",

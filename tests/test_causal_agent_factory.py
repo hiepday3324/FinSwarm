@@ -356,7 +356,6 @@ def _decide(bundle: dict, symbol: str, step: MarketStep, run: CausalRunContext):
         run_context=run,
         expected_outcome_date=step.date + dt.timedelta(days=1),
         split="train",
-        shadow_state=None,
         psychology_state=build_psychology_state(None),
     )
 
@@ -428,7 +427,6 @@ class CausalAgentFactoryTest(unittest.TestCase):
                     run_context=run,
                     expected_outcome_date=step.date + dt.timedelta(days=1),
                     split="train",
-                    shadow_state=None,
                     psychology_state=build_psychology_state(None),
                 )
         openai_embeddings.assert_not_called()

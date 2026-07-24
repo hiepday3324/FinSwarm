@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sys
 import time
@@ -32,6 +33,8 @@ from demo.graph_visualization import (
     make_network_figure,
 )
 from demo.inference import FrozenReplayEngine
+from puppy.common.schemas import AllocationWeights, PortfolioSnapshot
+from puppy.portfolio_ext.master_portfolio import MasterPortfolio
 
 
 st.set_page_config(
@@ -52,6 +55,9 @@ def _symbol_index(symbol: str) -> int:
 
 def _display_values(values: np.ndarray) -> dict[str, float]:
     return {symbol: float(values[_symbol_index(symbol)]) for symbol in DISPLAY_ORDER}
+
+
+DEMO_PRICE_FALLBACK = {"TSLA": 250.0, "NVDA": 500.0, "AAPL": 200.0}
 
 
 def _initialize_state(store: ReplayStore) -> None:
@@ -489,10 +495,10 @@ def _render_graph_features(
     feature_groups = (
         ("Market features", list(blocks["market_features"])),
         (
-            "Agent, Text and shadow priors",
+            "Agent, Text and master portfolio priors",
             list(blocks["action_signal"])
             + list(blocks["text_score"])
-            + list(blocks["prior_shadow_features"]),
+            + list(blocks["prior_master_portfolio_features"]),
         ),
         ("Psychology", list(blocks["prior_psychology_features"])),
     )
@@ -519,6 +525,7 @@ def _render_graph_features(
 
 
 def _render_fusion_and_allocation(
+    store: ReplayStore,
     engine: FrozenReplayEngine,
     output: dict[str, Any],
     previous: dict[str, Any] | None,
@@ -695,6 +702,230 @@ def _render_fusion_and_allocation(
         width="stretch",
     )
 
+    snapshots, _allocations = _replay_master_portfolio(
+        store=store,
+        engine=engine,
+        end_index=int(output["date_index"]),
+        capital=capital,
+        current_output=output,
+    )
+    snapshot = snapshots[-1]
+    previous_snapshot = snapshots[-2] if len(snapshots) > 1 else snapshot
+    _render_master_portfolio_snapshot(snapshot, previous_snapshot, snapshots)
+
+
+def _replay_master_portfolio(
+    *,
+    store: ReplayStore,
+    engine: FrozenReplayEngine,
+    end_index: int,
+    capital: float,
+    current_output: dict[str, Any] | None = None,
+) -> tuple[list[PortfolioSnapshot], list[AllocationWeights]]:
+    portfolio = MasterPortfolio(initial_cash=capital)
+    snapshots: list[PortfolioSnapshot] = []
+    allocations: list[AllocationWeights] = []
+    for index in range(end_index + 1):
+        replay_output = (
+            current_output
+            if current_output is not None and index == int(current_output["date_index"])
+            else engine.infer_date(index)
+        )
+        replay_date = store.dates[index]
+        replay_records = {
+            row["symbol"]: row for row in store.records_for_date(replay_date)
+        }
+        actions = {
+            symbol: str(replay_records[symbol]["decision"])
+            for symbol in DISPLAY_ORDER
+        }
+        probabilities = {
+            symbol: float(replay_output["fusion_probability"][_symbol_index(symbol)])
+            for symbol in DISPLAY_ORDER
+        }
+        prices, price_source = _demo_prices(replay_records)
+        demo_allocation = allocate(
+            actions,
+            probabilities,
+            capital=portfolio.equity(prices),
+        )
+        allocation = _allocation_weights_from_demo(replay_date, demo_allocation)
+        snapshot = portfolio.apply_allocation_weights(
+            allocation=allocation,
+            prices=prices,
+            date=replay_date,
+            as_of=_demo_cutoff(replay_date),
+        )
+        snapshot.metadata.update(
+            {
+                "allocation_source": "demo.allocator.allocate",
+                "price_source": price_source,
+                "prices": prices,
+                "target_weights": dict(allocation.weights),
+            }
+        )
+        snapshots.append(snapshot)
+        allocations.append(allocation)
+    return snapshots, allocations
+
+
+def _allocation_weights_from_demo(
+    replay_date: dt.date,
+    allocation: dict[str, Any],
+) -> AllocationWeights:
+    return AllocationWeights(
+        date=replay_date,
+        weights={
+            symbol: float(allocation["weights"][symbol]) for symbol in DISPLAY_ORDER
+        },
+        cash_weight=float(allocation["cash_weight"]),
+        reason="Demo target weights converted into MasterPortfolio accounting.",
+        metadata={
+            "source": "demo.allocator.allocate",
+            "stock_exposure": float(allocation["stock_exposure"]),
+            "total_weight": float(allocation["total_weight"]),
+        },
+    )
+
+
+def _demo_prices(
+    records: dict[str, dict[str, Any]],
+) -> tuple[dict[str, float], str]:
+    prices: dict[str, float] = {}
+    used_fallback = False
+    for symbol in DISPLAY_ORDER:
+        price = _price_from_record(records.get(symbol, {}), symbol)
+        if price is None:
+            price = DEMO_PRICE_FALLBACK[symbol]
+            used_fallback = True
+        prices[symbol] = float(price)
+    source = "artifact_price_bar" if not used_fallback else "display_fallback_prices"
+    return prices, source
+
+
+def _price_from_record(record: dict[str, Any], symbol: str) -> float | None:
+    containers: list[dict[str, Any]] = [record]
+    context_snapshot = record.get("context_snapshot")
+    if isinstance(context_snapshot, dict):
+        price_bar = context_snapshot.get("price_bar")
+        if isinstance(price_bar, dict):
+            containers.append(price_bar)
+    for container in containers:
+        for key in (
+            "close",
+            "adj_close",
+            "price",
+            "last_price",
+            "open_price",
+            "close_price",
+        ):
+            value = container.get(key)
+            if value not in (None, ""):
+                price = float(value)
+                if price > 0.0:
+                    return price
+    return None
+
+
+def _demo_cutoff(value: dt.date) -> dt.datetime:
+    return dt.datetime.combine(value, dt.time(16, 10))
+
+
+def _render_master_portfolio_snapshot(
+    snapshot: PortfolioSnapshot,
+    previous_snapshot: PortfolioSnapshot,
+    snapshots: list[PortfolioSnapshot],
+) -> None:
+    st.subheader("Master Portfolio accounting")
+    st.caption(
+        "Target weights are applied through puppy.portfolio_ext.MasterPortfolio; "
+        "artifact price bars are used when present."
+    )
+    equity_delta = snapshot.equity - previous_snapshot.equity
+    cash_delta = snapshot.cash - previous_snapshot.cash
+    stock_exposure = sum(float(value) for value in snapshot.weights.values())
+    previous_exposure = sum(float(value) for value in previous_snapshot.weights.values())
+    drawdown = snapshot.drawdown if snapshot.drawdown is not None else 0.0
+    daily_return = snapshot.daily_return if snapshot.daily_return is not None else 0.0
+
+    metrics = st.columns(4)
+    metrics[0].metric(
+        "Master equity",
+        f"${snapshot.equity:,.0f}",
+        f"{equity_delta:+,.0f}",
+    )
+    metrics[1].metric("Cash", f"${snapshot.cash:,.0f}", f"{cash_delta:+,.0f}")
+    metrics[2].metric(
+        "Stock exposure",
+        f"{stock_exposure:.1%}",
+        f"{stock_exposure - previous_exposure:+.1%}",
+    )
+    metrics[3].metric("Daily return / DD", f"{daily_return:+.2%}", f"{drawdown:+.2%}")
+
+    prices = snapshot.metadata.get("prices", {})
+    target_weights = snapshot.metadata.get("target_weights", {})
+    rows = []
+    for symbol in DISPLAY_ORDER:
+        shares = float(snapshot.positions.get(symbol, 0.0))
+        price = float(prices.get(symbol, DEMO_PRICE_FALLBACK[symbol]))
+        rows.append(
+            {
+                "Symbol": symbol,
+                "Shares": shares,
+                "Price": price,
+                "Position value": shares * price,
+                "Realized weight": float(snapshot.weights.get(symbol, 0.0)),
+                "Target weight": float(target_weights.get(symbol, 0.0)),
+            }
+        )
+    rows.append(
+        {
+            "Symbol": "Cash",
+            "Shares": np.nan,
+            "Price": np.nan,
+            "Position value": snapshot.cash,
+            "Realized weight": (
+                snapshot.cash / snapshot.equity if snapshot.equity else 0.0
+            ),
+            "Target weight": snapshot.metadata.get("target_cash_weight", 0.0),
+        }
+    )
+    st.dataframe(
+        pd.DataFrame(rows).set_index("Symbol").style.format(
+            {
+                "Shares": "{:,.2f}",
+                "Price": "${:,.2f}",
+                "Position value": "${:,.0f}",
+                "Realized weight": "{:.1%}",
+                "Target weight": "{:.1%}",
+            },
+            na_rep="N/A",
+        ),
+        width="stretch",
+    )
+
+    if len(snapshots) > 1:
+        curve = go.Figure(
+            go.Scatter(
+                x=[item.date for item in snapshots],
+                y=[item.equity for item in snapshots],
+                mode="lines+markers",
+                line={"color": "#0F766E", "width": 2},
+                marker={"size": 6},
+                name="Master equity",
+            )
+        )
+        curve.update_layout(
+            height=260,
+            margin={"l": 20, "r": 20, "t": 20, "b": 20},
+            yaxis={"tickprefix": "$", "gridcolor": "#E4E9E8"},
+            xaxis={"gridcolor": "#F0F3F2"},
+            font={"color": "#172126"},
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
+        )
+        st.plotly_chart(curve, width="stretch", config={"displayModeBar": False})
+
 
 def main() -> None:
     inject_css()
@@ -751,6 +982,7 @@ def main() -> None:
     )
     _render_graph_features(output, previous_for_attention, store.feature_schema)
     _render_fusion_and_allocation(
+        store,
         engine,
         output,
         previous_output,

@@ -3,7 +3,10 @@ from rich import print
 import hashlib
 import json
 import logging
-import guardrails as gd
+try:
+    import guardrails as gd
+except ImportError:
+    gd = None
 from datetime import date
 from enum import Enum
 from .run_type import RunMode
@@ -743,6 +746,13 @@ def trading_reflection(
             prompt=cur_prompt,
             investment_info=investment_info,
             allowed_memory_ids=allowed_memory_ids,
+        )
+
+    if gd is None:
+        raise RuntimeError(
+            "guardrails-ai is required for legacy non-strict reflection. "
+            "Use strict_output=True for the causal structured path, or install "
+            "the project with Python 3.10 as specified in pyproject.toml."
         )
 
     # prompt + validated output

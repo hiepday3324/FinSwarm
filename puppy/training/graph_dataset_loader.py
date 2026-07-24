@@ -15,7 +15,7 @@ from puppy.graph.graph_features import (
     ACTION_FEATURE_NAMES,
     MARKET_FEATURE_NAMES,
     PSYCHOLOGY_FEATURE_NAMES,
-    SHADOW_FEATURE_NAMES,
+    MASTER_PORTFOLIO_FEATURE_NAMES,
     TEXT_SCORE_FEATURE_NAMES,
 )
 
@@ -27,11 +27,11 @@ from .training_guard import SplitAccessGuard
 GRAPH_FEATURE_NAMES = CANONICAL_FEATURE_NAMES
 POLICY_DEPENDENT_GRAPH_FIELDS = {
     "action_signal",
-    "shadow_roi_prior",
-    "shadow_rolling_return_prior",
-    "shadow_drawdown_prior",
-    "shadow_sharpe_prior",
-    "shadow_win_rate_prior",
+    "master_symbol_weight_prior",
+    "master_cash_weight_prior",
+    "master_daily_return_prior",
+    "master_cumulative_return_prior",
+    "master_drawdown_prior",
     "text_score",
     "psychology_greed",
     "psychology_fear",
@@ -313,7 +313,7 @@ def graph_feature_schema(config: TrainingConfig | None = None) -> dict[str, Any]
             "market_features": list(MARKET_FEATURE_NAMES),
             "action_signal": list(ACTION_FEATURE_NAMES),
             "text_score": list(TEXT_SCORE_FEATURE_NAMES) if include_text_score else [],
-            "prior_shadow_features": list(SHADOW_FEATURE_NAMES),
+            "prior_master_portfolio_features": list(MASTER_PORTFOLIO_FEATURE_NAMES),
             "prior_psychology_features": list(PSYCHOLOGY_FEATURE_NAMES),
         },
         "required_policy_dependent_fields": sorted(

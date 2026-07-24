@@ -4,7 +4,7 @@ from datetime import date
 import numpy as np
 
 from puppy.common.enums import Decision
-from puppy.common.schemas import AgentContext, MemoryShareRoute
+from puppy.common.schemas import AgentContext, MemoryShareRoute, PortfolioSnapshot
 from puppy.debate.conflict_detector import build_debate_request, detect_conflict
 from puppy.debate.debate_loop import DebateLoop
 from puppy.debate.judge import DebateJudge
@@ -12,6 +12,7 @@ from puppy.fusion.text_encoder import TextStreamEncoder
 from puppy.memory_ext.memory_sharing import MemorySharingService
 from puppy.run_type import RunMode
 from puppy.swarm.protocols import decision_to_action
+from puppy.swarm.orchestrator import SwarmOrchestrator
 from puppy.swarm.run_swarm import run_mock_swarm
 from puppy.swarm.sector_agent import SectorAgent
 
@@ -110,6 +111,40 @@ class SwarmMvpTest(unittest.TestCase):
         self.assertTrue(duplicate.deduped)
         self.assertEqual(len(target.external_context_buffer), 1)
         self.assertEqual(event.shared_memory_ids, ["m1"])
+
+    def test_orchestrator_passes_master_portfolio_state_to_text_context(self):
+        cur_date = date(2026, 1, 3)
+        raw = {"investment_decision": "hold", "summary_reason": "Waiting for setup."}
+        agent = SectorAgent("sector_tsla", "TSLA", FakeLLMAgent(raw))
+        encoder = TextStreamEncoder(
+            embedding_func=lambda text: np.array([[len(text)]], dtype=np.float32),
+            embedding_model="fake-embedding",
+        )
+        master_snapshot = PortfolioSnapshot(
+            date=date(2026, 1, 2),
+            cash=25000.0,
+            positions={"TSLA": 300.0},
+            weights={"TSLA": 0.75},
+            equity=100000.0,
+        )
+
+        result = SwarmOrchestrator(
+            agents=[agent],
+            text_encoder=encoder,
+        ).run_day(
+            cur_date=cur_date,
+            market_info_by_symbol={
+                "TSLA": (cur_date, 100.0, None, None, [], 0.0, False)
+            },
+            run_mode=RunMode.Test,
+            master_portfolio_state=master_snapshot,
+        )
+
+        self.assertEqual(
+            result["contexts"][0].master_portfolio_state["equity"],
+            100000.0,
+        )
+        self.assertIn("Master portfolio state", result["text_features"][0].raw_context)
 
     def test_conflict_detector_and_debate(self):
         self.assertTrue(detect_conflict(text_signal=1, graph_signal=-1, fusion_score=0.9))

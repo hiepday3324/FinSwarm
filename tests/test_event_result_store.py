@@ -13,7 +13,6 @@ from puppy.common.schemas import (
     MemoryShareRoute,
     PortfolioSnapshot,
     QuantFeatureTable,
-    ShadowPortfolioState,
     TextFeature,
 )
 from puppy.data_engine.event_store import EventStore
@@ -105,48 +104,42 @@ class EventResultStoreTest(unittest.TestCase):
             self.assertEqual(features[0].h_text, [0.1, 0.2, 0.3])
             self.assertEqual(features[0].dim, 3)
 
-    def test_shadow_portfolio_state_typed_helpers_and_filters(self) -> None:
+    def test_master_portfolio_snapshot_typed_helper_and_date_filter(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "events.jsonl")
             event_store = EventStore(path)
             date = dt.date(2026, 1, 2)
             next_date = dt.date(2026, 1, 3)
-            event_store.append_shadow_portfolio_state(
+            event_store.append_portfolio_snapshot(
                 date,
-                ShadowPortfolioState(
+                PortfolioSnapshot(
                     date=date,
-                    agent_id="sector_tsla",
-                    symbol="TSLA",
-                    value=1.04,
-                    roi=0.04,
+                    cash=60000.0,
+                    positions={"TSLA": 400.0},
+                    weights={"TSLA": 0.4},
+                    equity=100000.0,
                 ),
             )
-            event_store.append_shadow_portfolio_state(
+            event_store.append_portfolio_snapshot(
                 next_date,
-                ShadowPortfolioState(
+                PortfolioSnapshot(
                     date=next_date,
-                    agent_id="sector_nvda",
-                    symbol="NVDA",
-                    value=0.98,
-                    roi=-0.02,
+                    cash=50000.0,
+                    positions={"NVDA": 100.0},
+                    weights={"NVDA": 0.5},
+                    equity=99000.0,
                 ),
             )
 
             result_store = ResultStore(event_store)
-            self.assertEqual(len(result_store.read_shadow_portfolio_states()), 2)
+            self.assertEqual(len(result_store.read_portfolio_snapshots()), 2)
             self.assertEqual(
-                len(result_store.read_shadow_portfolio_states(date=date)),
+                len(result_store.read_portfolio_snapshots(date=date)),
                 1,
             )
             self.assertEqual(
-                result_store.read_shadow_portfolio_states(
-                    agent_id="sector_tsla"
-                )[0].symbol,
-                "TSLA",
-            )
-            self.assertEqual(
-                result_store.read_shadow_portfolio_states(symbol="NVDA")[0].agent_id,
-                "sector_nvda",
+                result_store.read_portfolio_snapshots(next_date)[0].equity,
+                99000.0,
             )
 
     def test_graph_output_and_memory_share_route_typed_helpers(self) -> None:

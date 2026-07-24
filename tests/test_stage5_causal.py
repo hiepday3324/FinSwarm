@@ -13,16 +13,18 @@ import yaml
 
 from puppy.common.schemas import (
     AgentContext,
+    AllocationWeights,
     CausalRunContext,
     MarketStep,
     PendingDecision,
+    PortfolioSnapshot,
     PriceBar,
 )
 from puppy.data_engine.duckdb_store import DuckDBMarketStore
 from puppy.data_engine.normalization import FILING_SCHEMA, NEWS_SCHEMA, PRICE_SCHEMA, write_records
 from puppy.graph.graph_dataset import FEATURE_NAMES, build_causal_graph_sample
-from puppy.portfolio_ext.shadow_portfolio import ShadowPortfolio
-from puppy.swarm.causal_orchestrator import CausalOrchestrator, build_context_hash
+from puppy.portfolio_ext.master_portfolio import MasterPortfolio
+from puppy.swarm.causal_orchestrator import CausalOrchestrator
 from puppy.swarm.legacy_finmem_adapter import ADAPTER_VERSION, LegacyFinMemAdapter
 from puppy.swarm.sector_agent import SectorAgent
 from puppy.training.artifact_generator import generate_training_artifacts
@@ -77,6 +79,59 @@ class Stage5CausalContractTest(unittest.TestCase):
         self.assertNotIn(bundle.output.signal.reason, bundle.text_feature.raw_context)
         self.assertEqual(bundle.context.context_hash, bundle.text_feature.context_hash)
         self.assertEqual(bundle.context.context_hash, bundle.pending.context_hash)
+
+    def test_causal_context_includes_prior_master_portfolio_only(self) -> None:
+        date = dt.date(2026, 1, 2)
+        legacy = _ExplodingLegacyAgent()
+        adapter = LegacyFinMemAdapter(legacy, "sector_tsla", "TSLA", bootstrap=True)
+        agent = SectorAgent("sector_tsla", "TSLA", legacy, causal_adapter=adapter)
+        step = _market_step(date)
+        run = _run_context(date, step.as_of)
+        adapter.advance_memory_clock(date, run)
+        snapshot = PortfolioSnapshot(
+            date=date - dt.timedelta(days=1),
+            as_of=_cutoff(date - dt.timedelta(days=1)),
+            cash=50000.0,
+            positions={"TSLA": 250.0},
+            weights={"TSLA": 0.5},
+            equity=101000.0,
+            daily_return=0.01,
+            drawdown=-0.02,
+        )
+
+        bundle = CausalOrchestrator().decide(
+            agent=agent,
+            market_step=step,
+            run_context=run,
+            expected_outcome_date=dt.date(2026, 1, 5),
+            split="train",
+            master_portfolio_state=snapshot,
+        )
+
+        self.assertEqual(bundle.context.master_portfolio_state["equity"], 101000.0)
+        self.assertIn("Master portfolio state", bundle.text_feature.raw_context)
+        self.assertIn('"cash": 50000.0', bundle.text_feature.raw_context)
+
+        future_adapter = LegacyFinMemAdapter(SimpleNamespace(), "sector_tsla", "TSLA", bootstrap=True)
+        future_agent = SectorAgent(
+            "sector_tsla",
+            "TSLA",
+            SimpleNamespace(),
+            causal_adapter=future_adapter,
+        )
+        future_adapter.advance_memory_clock(date, run)
+        future_snapshot = snapshot.model_copy(
+            update={"as_of": step.as_of + dt.timedelta(minutes=1)}
+        )
+        with self.assertRaisesRegex(AssertionError, "MasterPortfolio"):
+            CausalOrchestrator().decide(
+                agent=future_agent,
+                market_step=step,
+                run_context=run,
+                expected_outcome_date=dt.date(2026, 1, 5),
+                split="train",
+                master_portfolio_state=future_snapshot,
+            )
 
     def test_memory_routing_idempotence_feedback_and_decay_boundaries(self) -> None:
         date = dt.date(2026, 1, 2)
@@ -148,7 +203,7 @@ class Stage5CausalContractTest(unittest.TestCase):
         adapter.decide(step, context, forced)
         self.assertEqual(llm.calls, 2)
 
-    def test_outcome_formula_next_common_date_threshold_and_shadow_timing(self) -> None:
+    def test_outcome_formula_and_master_portfolio_accounting(self) -> None:
         friday = dt.date(2026, 1, 2)
         monday = dt.date(2026, 1, 5)
         pending = _pending(friday, monday)
@@ -175,16 +230,27 @@ class Stage5CausalContractTest(unittest.TestCase):
                 outcome_date=dt.date(2026, 1, 3),
                 available_at=_cutoff(monday),
             )
-        portfolio = ShadowPortfolio()
-        self.assertIsNone(portfolio.get_state("sector_tsla", "TSLA"))
-        state = portfolio.resolve_outcome(
-            agent_id="sector_tsla", symbol="TSLA", action_signal=1,
-            realized_return=positive.asset_return, decision_date=friday,
-            outcome_date=monday, as_of=_cutoff(monday),
+        portfolio = MasterPortfolio(initial_cash=100000.0)
+        allocation = AllocationWeights(
+            date=friday,
+            weights={"TSLA": 1.0},
+            cash_weight=0.0,
         )
-        self.assertEqual(state.last_resolved_decision_date, friday)
-        self.assertEqual(state.last_outcome_date, monday)
-        self.assertEqual(state.number_of_resolved_decisions, 1)
+        portfolio.apply_target_weights(
+            date=friday,
+            prices={"TSLA": 100.0},
+            target_weights=allocation,
+            as_of=_cutoff(friday),
+        )
+        state = portfolio.apply_target_weights(
+            date=monday,
+            prices={"TSLA": 101.0},
+            target_weights=allocation,
+            as_of=_cutoff(monday),
+        )
+        self.assertEqual(state.date, monday)
+        self.assertAlmostEqual(state.daily_return, positive.asset_return)
+        self.assertAlmostEqual(state.cumulative_return, positive.asset_return)
 
     def test_future_price_perturbation_leaves_decision_time_artifacts_unchanged(self) -> None:
         t = dt.date(2026, 1, 2)
@@ -207,11 +273,11 @@ class Stage5CausalContractTest(unittest.TestCase):
             expected_outcome_date=nxt, split="train",
         )
         graph_a = build_causal_graph_sample(
-            observed_a, {"TSLA": bundle.output.signal.action_signal}, {"TSLA": None},
+            observed_a, {"TSLA": bundle.output.signal.action_signal}, None,
             {"TSLA": bundle.text_feature}, {"TSLA": []}, {"TSLA": []},
         )
         graph_b = build_causal_graph_sample(
-            observed_b, {"TSLA": bundle.output.signal.action_signal}, {"TSLA": None},
+            observed_b, {"TSLA": bundle.output.signal.action_signal}, None,
             {"TSLA": bundle.text_feature}, {"TSLA": []}, {"TSLA": []},
         )
         np.testing.assert_array_equal(graph_a["feature_matrix"], graph_b["feature_matrix"])
@@ -237,40 +303,65 @@ class Stage5CausalContractTest(unittest.TestCase):
         outcome_a = resolve_outcome(bundle.pending, PriceBar(symbol="TSLA", date=nxt, open=1, close=1000), outcome_date=nxt, available_at=_cutoff(nxt))
         outcome_b = resolve_outcome(bundle.pending, PriceBar(symbol="TSLA", date=nxt, open=1000, close=1), outcome_date=nxt, available_at=_cutoff(nxt))
         self.assertNotEqual(outcome_a.asset_return, outcome_b.asset_return)
-        portfolio_a = ShadowPortfolio()
-        portfolio_b = ShadowPortfolio()
-        state_a = portfolio_a.resolve_outcome(agent_id="sector_tsla", symbol="TSLA", action_signal=1, realized_return=outcome_a.asset_return, decision_date=t, outcome_date=nxt, as_of=_cutoff(nxt))
-        state_b = portfolio_b.resolve_outcome(agent_id="sector_tsla", symbol="TSLA", action_signal=1, realized_return=outcome_b.asset_return, decision_date=t, outcome_date=nxt, as_of=_cutoff(nxt))
-        self.assertNotEqual(state_a.value, state_b.value)
+        portfolio_a = MasterPortfolio(initial_cash=100000.0)
+        portfolio_b = MasterPortfolio(initial_cash=100000.0)
+        allocation = AllocationWeights(
+            date=t,
+            weights={"TSLA": 1.0},
+            cash_weight=0.0,
+        )
+        for portfolio in (portfolio_a, portfolio_b):
+            portfolio.apply_target_weights(
+                date=t,
+                prices={"TSLA": 100.0},
+                target_weights=allocation,
+                as_of=_cutoff(t),
+            )
+        state_a = portfolio_a.apply_target_weights(
+            date=nxt,
+            prices={"TSLA": 1000.0},
+            target_weights=allocation,
+            as_of=_cutoff(nxt),
+        )
+        state_b = portfolio_b.apply_target_weights(
+            date=nxt,
+            prices={"TSLA": 1.0},
+            target_weights=allocation,
+            as_of=_cutoff(nxt),
+        )
+        self.assertNotEqual(state_a.equity, state_b.equity)
         reflection_a = adapter.learn_from_outcome(bundle.pending, outcome_a, _run_context(nxt, _cutoff(nxt)))
         reflection_b = adapter.learn_from_outcome(bundle.pending, outcome_b, _run_context(nxt, _cutoff(nxt)))
         self.assertNotEqual(reflection_a.text, reflection_b.text)
-        run_next = _run_context(nxt, _cutoff(nxt))
+        later_date = dt.date(2026, 1, 6)
+        run_next = _run_context(later_date, _cutoff(later_date))
         next_step_a = MarketStep(
-            date=nxt, symbols=["TSLA"],
-            prices={"TSLA": PriceBar(symbol="TSLA", date=nxt, open=1, high=1000, low=1, close=1000)},
+            date=later_date, symbols=["TSLA"],
+            prices={"TSLA": PriceBar(symbol="TSLA", date=later_date, open=1000, high=1000, low=1000, close=1000)},
             news={"TSLA": []}, filings={"TSLA": []}, as_of=run_next.current_cutoff,
         )
         next_step_b = MarketStep(
-            date=nxt, symbols=["TSLA"],
-            prices={"TSLA": PriceBar(symbol="TSLA", date=nxt, open=1000, high=1000, low=1, close=1)},
+            date=later_date, symbols=["TSLA"],
+            prices={"TSLA": PriceBar(symbol="TSLA", date=later_date, open=1, high=1, low=1, close=1)},
             news={"TSLA": []}, filings={"TSLA": []}, as_of=run_next.current_cutoff,
         )
         adapter_a = LegacyFinMemAdapter(SimpleNamespace(), "sector_tsla", "TSLA", bootstrap=True)
         adapter_b = LegacyFinMemAdapter(SimpleNamespace(), "sector_tsla", "TSLA", bootstrap=True)
-        adapter_a.advance_memory_clock(nxt, run_next)
-        adapter_b.advance_memory_clock(nxt, run_next)
+        adapter_a.advance_memory_clock(later_date, run_next)
+        adapter_b.advance_memory_clock(later_date, run_next)
         adapter_a.ingest_reflection(reflection_a, run_next)
         adapter_b.ingest_reflection(reflection_b, run_next)
         later_a = CausalOrchestrator().decide(
             agent=SectorAgent("sector_tsla", "TSLA", SimpleNamespace(), causal_adapter=adapter_a),
             market_step=next_step_a, run_context=run_next,
-            expected_outcome_date=dt.date(2026, 1, 6), split="train", shadow_state=state_a,
+            expected_outcome_date=dt.date(2026, 1, 7), split="train",
+            master_portfolio_state=state_a,
         )
         later_b = CausalOrchestrator().decide(
             agent=SectorAgent("sector_tsla", "TSLA", SimpleNamespace(), causal_adapter=adapter_b),
             market_step=next_step_b, run_context=run_next,
-            expected_outcome_date=dt.date(2026, 1, 6), split="train", shadow_state=state_b,
+            expected_outcome_date=dt.date(2026, 1, 7), split="train",
+            master_portfolio_state=state_b,
         )
         self.assertNotEqual(later_a.context.context_hash, later_b.context.context_hash)
 
@@ -281,7 +372,7 @@ class Stage5CausalContractTest(unittest.TestCase):
         observed = build_observed_feature_table(step, {"TSLA": [step.prices["TSLA"]]})
         text = SimpleNamespace(h_text=[0.1, 0.2])
         sample = build_causal_graph_sample(
-            observed, {"TSLA": 1}, {"TSLA": None}, {"TSLA": text},
+            observed, {"TSLA": 1}, None, {"TSLA": text},
             {"TSLA": [0.01]}, {"TSLA": [date]},
         )
         self.assertEqual(sample["feature_matrix"].shape[1], len(FEATURE_NAMES))
@@ -289,7 +380,7 @@ class Stage5CausalContractTest(unittest.TestCase):
         self.assertFalse(sample["metadata"]["targets_in_feature_matrix"])
         with self.assertRaisesRegex(ValueError, "future source"):
             build_causal_graph_sample(
-                observed, {"TSLA": 1}, {"TSLA": None}, {"TSLA": text},
+                observed, {"TSLA": 1}, None, {"TSLA": text},
                 {"TSLA": [0.01]}, {"TSLA": [dt.date(2026, 1, 5)]},
             )
 

@@ -18,10 +18,14 @@ from transformers import AutoTokenizer
 
 def causal_memory_inputs(agent_context: Any) -> tuple[dict[str, list[str]], dict[str, list[int]]]:
     short_memory = list(agent_context.short_memory)
-    if agent_context.shadow_state is not None:
+    if agent_context.master_portfolio_state is not None:
         short_memory.append(
-            "Prior ShadowPortfolio state: "
-            + json.dumps(agent_context.shadow_state, sort_keys=True, default=str)
+            "Prior MasterPortfolio state: "
+            + json.dumps(
+                agent_context.master_portfolio_state,
+                sort_keys=True,
+                default=str,
+            )
         )
     if agent_context.psychology_state is not None:
         short_memory.append(

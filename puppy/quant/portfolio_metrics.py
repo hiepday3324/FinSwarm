@@ -5,7 +5,7 @@ from collections.abc import Iterable
 
 
 def _clean(values: Iterable[float | int | None]) -> list[float]:
-    cleaned = []
+    cleaned: list[float] = []
     for value in values:
         if value is None:
             continue
@@ -15,7 +15,7 @@ def _clean(values: Iterable[float | int | None]) -> list[float]:
     return cleaned
 
 
-def compute_roi(value: float, initial_value: float) -> float:
+def compute_return(value: float, initial_value: float) -> float:
     if initial_value == 0:
         return 0.0
     return float(value) / float(initial_value) - 1.0
@@ -60,5 +60,4 @@ def compute_win_rate(returns: Iterable[float | int | None]) -> float:
     values = _clean(returns)
     if not values:
         return 0.0
-    wins = sum(1 for value in values if value > 0)
-    return wins / len(values)
+    return sum(1 for value in values if value > 0) / len(values)

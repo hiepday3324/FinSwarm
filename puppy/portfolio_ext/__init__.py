@@ -1,1 +1,1 @@
-"""Shadow and master portfolio extensions."""
+"""Master portfolio accounting and allocation extensions."""

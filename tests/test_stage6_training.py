@@ -263,7 +263,7 @@ def _pending() -> dict[str, object]:
         "long_memory": ["long gamma"],
         "latest_reason": "FORBIDDEN_REASON",
         "reflection_memory": ["FORBIDDEN_REFLECTION"],
-        "shadow_state": {"secret": "FORBIDDEN_SHADOW"},
+        "master_portfolio_state": {"secret": "MASTER_PORTFOLIO_PRIOR"},
         "shared_context": ["FORBIDDEN_SHARED"],
         "psychology_state": {"state": "fear"},
     }
@@ -312,9 +312,9 @@ class Stage6TextEmbeddingTest(unittest.TestCase):
         text, _ = canonical_memory_text(_pending())
         self.assertIn("FORBIDDEN_REFLECTION", text)
 
-    def test_semantic_view_includes_prior_shadow_and_psychology(self) -> None:
+    def test_semantic_view_includes_prior_master_portfolio_and_psychology(self) -> None:
         text, _ = canonical_memory_text(_pending())
-        self.assertIn("FORBIDDEN_SHADOW", text)
+        self.assertIn("MASTER_PORTFOLIO_PRIOR", text)
         self.assertIn('"state": "fear"', text)
 
     def test_semantic_embedding_dimension_is_384(self) -> None:

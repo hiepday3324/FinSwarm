@@ -10,7 +10,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from puppy.common.schemas import QuantFeatureTable, ShadowPortfolioState, TextFeature  # noqa: E402
+from puppy.common.schemas import PortfolioSnapshot, QuantFeatureTable, TextFeature  # noqa: E402
 from puppy.data_engine.event_store import EventStore  # noqa: E402
 from puppy.data_engine.result_store import ResultStore  # noqa: E402
 from puppy.fusion.dataset import build_text_score_dataset  # noqa: E402
@@ -54,25 +54,23 @@ def _quant_table(date: dt.date) -> QuantFeatureTable:
     )
 
 
-def _shadow_states(date: dt.date) -> list[ShadowPortfolioState]:
-    return [
-        ShadowPortfolioState(
-            date=date,
-            agent_id=f"sector_{symbol.lower()}",
-            symbol=symbol,
-            value=value,
-            roi=value - 1.0,
-            rolling_return=value - 1.0,
-            sharpe=0.5,
-            drawdown=drawdown,
-            win_rate=win_rate,
-        )
-        for symbol, value, drawdown, win_rate in [
-            ("TSLA", 1.04, 0.0, 1.0),
-            ("NVDA", 1.02, -0.01, 0.5),
-            ("AAPL", 0.99, -0.03, 0.0),
-        ]
-    ]
+def _master_portfolio_state(date: dt.date) -> PortfolioSnapshot:
+    prior_date = date - dt.timedelta(days=1)
+    return PortfolioSnapshot(
+        date=prior_date,
+        as_of=dt.datetime.combine(prior_date, dt.time(16, 10), dt.timezone.utc),
+        cash=25000.0,
+        cash_weight=0.25,
+        positions={"TSLA": 120.0, "NVDA": 40.0, "AAPL": 125.0},
+        weights={"TSLA": 0.30, "NVDA": 0.20, "AAPL": 0.25},
+        equity=100000.0,
+        daily_return=0.006,
+        cumulative_return=0.04,
+        rolling_return=0.04,
+        sharpe=0.8,
+        drawdown=-0.01,
+        win_rate=0.6,
+    )
 
 
 def run_milestone_6_fusion(event_store_path: str | None = None) -> dict[str, Any]:
@@ -93,7 +91,7 @@ def run_milestone_6_fusion(event_store_path: str | None = None) -> dict[str, Any
     graph_output = build_gat_graph_output(
         date=date,
         quant_table=quant_table,
-        shadow_states=_shadow_states(date),
+        master_portfolio_state=_master_portfolio_state(date),
         text_features=text_features,
         return_history={
             "TSLA": [0.01, 0.03, -0.01, 0.02],

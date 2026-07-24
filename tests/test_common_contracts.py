@@ -22,7 +22,6 @@ from puppy.common import (
     PriceBar,
     QuantFeatureTable,
     SharedContext,
-    ShadowPortfolioState,
     TextFeature,
 )
 
@@ -76,21 +75,13 @@ class CommonContractsTest(unittest.TestCase):
             weights={"TSLA": 0.4},
             equity=100000.0,
         )
-        shadow = ShadowPortfolioState(
-            date=date,
-            agent_id="fake_tsla",
-            symbol="TSLA",
-            value=1.01,
-            roi=0.01,
-        )
-
         self.assertEqual(market_step.prices["TSLA"].close, 100.0)
         self.assertEqual(quant_table.action_signals["TSLA"], 1)
         self.assertEqual(graph_output.symbols, ["TSLA"])
         self.assertEqual(fusion_output.symbols, ["TSLA"])
         self.assertAlmostEqual(allocation.cash_weight, 0.6)
         self.assertEqual(snapshot.equity, 100000.0)
-        self.assertEqual(shadow.symbol, "TSLA")
+        self.assertEqual(snapshot.weights["TSLA"], 0.4)
 
     def test_existing_tien_contracts_still_import_and_instantiate(self) -> None:
         date = dt.date(2026, 1, 2)

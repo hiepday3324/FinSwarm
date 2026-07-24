@@ -3,6 +3,7 @@ from datetime import date
 from typing import Any
 
 from puppy.common.schemas import AgentContext, AgentOutput, TextFeature
+from puppy.portfolio_ext.master_portfolio import portfolio_snapshot_to_context
 from puppy.run_type import RunMode
 
 from .allocator_agent import AllocatorAgent
@@ -26,12 +27,13 @@ class SwarmOrchestrator:
         cur_date: date,
         market_info_by_symbol: dict[str, tuple],
         run_mode: RunMode,
-        shadow_state_by_agent: Mapping[str, Any] | None = None,
+        master_portfolio_state: Any | None = None,
         psychology_state_by_agent: Mapping[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         outputs: list[AgentOutput] = []
         contexts: list[AgentContext] = []
         text_features: list[TextFeature] = []
+        master_context = portfolio_snapshot_to_context(master_portfolio_state)
 
         for agent in self.agents:
             output = agent.step(
@@ -40,15 +42,17 @@ class SwarmOrchestrator:
             )
 
             if self.text_encoder is not None:
-                shadow_state = _lookup_agent_state(shadow_state_by_agent, agent)
                 psychology_state = _lookup_agent_state(psychology_state_by_agent, agent)
-                if psychology_state is None and shadow_state is not None:
-                    psychology_state = build_psychology_state(shadow_state)
+                if psychology_state is None:
+                    psychology_state = build_psychology_state(
+                        master_context,
+                        symbol=agent.symbol,
+                    )
                 context = build_agent_context(
                     sector_agent=agent,
                     cur_date=cur_date,
                     latest_reason=output.signal.reason,
-                    shadow_state=_to_context_dict(shadow_state),
+                    master_portfolio_state=master_context,
                     psychology_state=psychology_state,
                 )
                 contexts.append(context)
@@ -69,6 +73,7 @@ class SwarmOrchestrator:
             "contexts": contexts,
             "text_features": text_features,
             "allocation": allocation,
+            "master_portfolio_state": master_context,
         }
 
 
@@ -90,13 +95,14 @@ def _to_context_dict(value: Any | None) -> dict[str, Any] | None:
     if value is None:
         return None
     if hasattr(value, "model_dump"):
-        return value.model_dump()
+        return value.model_dump(mode="json")
     if isinstance(value, Mapping):
         return dict(value)
     return {
         key: getattr(value, key)
         for key in (
             "date",
+            "as_of",
             "agent_id",
             "symbol",
             "value",
@@ -105,6 +111,11 @@ def _to_context_dict(value: Any | None) -> dict[str, Any] | None:
             "sharpe",
             "drawdown",
             "win_rate",
+            "cash",
+            "positions",
+            "weights",
+            "equity",
+            "daily_return",
             "metadata",
         )
         if hasattr(value, key)

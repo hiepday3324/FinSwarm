@@ -6,14 +6,14 @@ from typing import Any
 
 import numpy as np
 
-from puppy.common.schemas import ObservedFeatureTable, QuantFeatureTable, ShadowPortfolioState, TextFeature
+from puppy.common.schemas import ObservedFeatureTable, PortfolioSnapshot, QuantFeatureTable, TextFeature
 from puppy.fusion.text_feature_contract import validate_text_feature_batch
 from puppy.graph.correlation_graph import build_correlation_adjacency
 from puppy.graph.graph_features import (
     ACTION_FEATURE_NAMES,
     MARKET_FEATURE_NAMES,
     PSYCHOLOGY_FEATURE_NAMES,
-    SHADOW_FEATURE_NAMES,
+    MASTER_PORTFOLIO_FEATURE_NAMES,
     TEXT_SCORE_FEATURE_NAMES,
     build_causal_node_features,
     build_node_features,
@@ -24,21 +24,22 @@ CANONICAL_FEATURE_NAMES = (
     MARKET_FEATURE_NAMES
     + ACTION_FEATURE_NAMES
     + TEXT_SCORE_FEATURE_NAMES
-    + SHADOW_FEATURE_NAMES
+    + MASTER_PORTFOLIO_FEATURE_NAMES
     + PSYCHOLOGY_FEATURE_NAMES
 )
 FEATURE_NAMES = list(CANONICAL_FEATURE_NAMES)
 
 LEGACY_FEATURE_NAMES = [
-    "action_signal", "return", "label", "shadow_roi", "shadow_drawdown",
-    "shadow_sharpe", "shadow_win_rate", "text_norm", "num_text_features",
+    "action_signal", "return", "label", "master_symbol_weight",
+    "master_cash_weight", "master_daily_return", "master_drawdown",
+    "text_norm", "num_text_features",
 ]
 
 
 def build_causal_graph_sample(
     observed_table: ObservedFeatureTable,
     action_signals: dict[str, int],
-    shadow_states: dict[str, ShadowPortfolioState | None] | None = None,
+    master_portfolio_state: PortfolioSnapshot | dict[str, Any] | None = None,
     text_features: dict[str, TextFeature] | None = None,
     return_history: dict[str, list[float]] | None = None,
     return_source_dates: dict[str, list[Any]] | None = None,
@@ -47,7 +48,6 @@ def build_causal_graph_sample(
     psychology_states: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     symbols = list(observed_table.symbols)
-    shadow_states = shadow_states or {}
     text_features = text_features or {}
     if text_scores is None:
         text_scores = {
@@ -63,7 +63,7 @@ def build_causal_graph_sample(
         observed_table,
         action_signals,
         text_scores,
-        shadow_states,
+        master_portfolio_state,
         psychology_states,
     )
     values = [
@@ -117,7 +117,7 @@ def build_causal_graph_sample(
                 "market_features": list(MARKET_FEATURE_NAMES),
                 "action_signal": list(ACTION_FEATURE_NAMES),
                 "text_score": list(TEXT_SCORE_FEATURE_NAMES),
-                "prior_shadow_features": list(SHADOW_FEATURE_NAMES),
+                "prior_master_portfolio_features": list(MASTER_PORTFOLIO_FEATURE_NAMES),
                 "prior_psychology_features": list(PSYCHOLOGY_FEATURE_NAMES),
             },
             "feature_dimension": len(FEATURE_NAMES),
@@ -136,7 +136,7 @@ def build_causal_graph_sample(
 
 def build_graph_sample(
     quant_table: QuantFeatureTable,
-    shadow_states: list[ShadowPortfolioState] | None = None,
+    master_portfolio_state: PortfolioSnapshot | dict[str, Any] | None = None,
     text_features: list[TextFeature] | None = None,
     return_history: dict[str, list[float]] | None = None,
 ) -> dict[str, Any]:
@@ -148,7 +148,7 @@ def build_graph_sample(
     symbols = list(quant_table.symbols)
     node_features = build_node_features(
         quant_table=quant_table,
-        shadow_states=shadow_states,
+        master_portfolio_state=master_portfolio_state,
         text_features=text_features,
     )
     feature_matrix = np.asarray(

@@ -161,7 +161,7 @@ def validate_training_artifacts(
     if tuple(graph_names) != CANONICAL_FEATURE_NAMES:
         raise ValueError(
             "Stage 5 graph artifacts require regeneration: expected canonical "
-            "market/action/text_score/prior_shadow/prior_psychology feature order"
+            "market/action/text_score/prior_master/prior_psychology feature order"
         )
     forbidden = sorted(FORBIDDEN_GRAPH_FIELDS.intersection(graph_names))
     graph_violations = len(forbidden)
@@ -171,16 +171,29 @@ def validate_training_artifacts(
         dt.date.fromisoformat(source) > dt.date.fromisoformat(decision)
         for source, decision in zip(graph["max_source_dates"].astype(str), graph["decision_dates"].astype(str))
     )
-    shadow_violations = 0
+    master_portfolio_violations = 0
     psychology_violations = 0
     current_outcome_context_violations = 0
     for pending in pending_rows:
         snapshot = _parse_json(pending["context_snapshot"])
         agent_context = snapshot.get("agent_context") or {}
-        state = agent_context.get("shadow_state")
-        if state and state.get("last_resolved_decision_date"):
-            shadow_violations += int(dt.date.fromisoformat(state["last_resolved_decision_date"]) >= pending["decision_date"])
-        expected_psychology = build_psychology_state(state)
+        state = agent_context.get("master_portfolio_state")
+        if state:
+            state_date = state.get("date")
+            state_as_of = state.get("as_of")
+            if state_date:
+                master_portfolio_violations += int(
+                    dt.date.fromisoformat(str(state_date)[:10])
+                    >= pending["decision_date"]
+                )
+            if state_as_of:
+                master_portfolio_violations += int(
+                    _parse_datetime(state_as_of) >= pending["decision_cutoff"]
+                )
+        expected_psychology = build_psychology_state(
+            state,
+            symbol=agent_context.get("symbol"),
+        )
         psychology_violations += int(
             agent_context.get("psychology_state") != expected_psychology
         )
@@ -271,7 +284,7 @@ def validate_training_artifacts(
         "future_price_violations": future_price_violations + graph_future,
         "future_event_violations": future_event_violations,
         "same_day_reflection_violations": same_day_reflections,
-        "shadow_timing_violations": shadow_violations,
+        "master_portfolio_timing_violations": master_portfolio_violations,
         "psychology_prior_state_violations": psychology_violations,
         "current_outcome_context_violations": current_outcome_context_violations,
         "graph_forbidden_feature_violations": graph_violations,

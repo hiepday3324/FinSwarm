@@ -16,7 +16,6 @@ from puppy.common.schemas import (
     MemoryShareRoute,
     PortfolioSnapshot,
     QuantFeatureTable,
-    ShadowPortfolioState,
     TextFeature,
 )
 
@@ -68,22 +67,6 @@ class ResultStore:
             PortfolioSnapshot(**payload)
             for payload in self.read_artifacts("PortfolioSnapshot", date=date)
         ]
-
-    def read_shadow_portfolio_states(
-        self,
-        date: dt.date | str | None = None,
-        agent_id: str | None = None,
-        symbol: str | None = None,
-    ) -> list[ShadowPortfolioState]:
-        states = [
-            ShadowPortfolioState(**payload)
-            for payload in self.read_artifacts("ShadowPortfolioState", date=date)
-        ]
-        if agent_id is not None:
-            states = [state for state in states if state.agent_id == agent_id]
-        if symbol is not None:
-            states = [state for state in states if state.symbol == symbol]
-        return states
 
     def read_graph_outputs(
         self,

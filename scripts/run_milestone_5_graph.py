@@ -10,7 +10,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from puppy.common.schemas import QuantFeatureTable, ShadowPortfolioState, TextFeature  # noqa: E402
+from puppy.common.schemas import PortfolioSnapshot, QuantFeatureTable, TextFeature  # noqa: E402
 from puppy.data_engine.event_store import EventStore  # noqa: E402
 from puppy.data_engine.result_store import ResultStore  # noqa: E402
 from puppy.graph.graph_builder import build_graph_output  # noqa: E402
@@ -31,42 +31,23 @@ def _quant_table(date: dt.date) -> QuantFeatureTable:
     )
 
 
-def _shadow_states(date: dt.date) -> list[ShadowPortfolioState]:
-    return [
-        ShadowPortfolioState(
-            date=date,
-            agent_id="sector_tsla",
-            symbol="TSLA",
-            value=1.04,
-            roi=0.04,
-            rolling_return=0.04,
-            sharpe=0.8,
-            drawdown=0.0,
-            win_rate=1.0,
-        ),
-        ShadowPortfolioState(
-            date=date,
-            agent_id="sector_nvda",
-            symbol="NVDA",
-            value=1.02,
-            roi=0.02,
-            rolling_return=0.02,
-            sharpe=0.5,
-            drawdown=-0.01,
-            win_rate=0.5,
-        ),
-        ShadowPortfolioState(
-            date=date,
-            agent_id="sector_aapl",
-            symbol="AAPL",
-            value=1.0,
-            roi=0.0,
-            rolling_return=0.0,
-            sharpe=0.0,
-            drawdown=-0.02,
-            win_rate=0.0,
-        ),
-    ]
+def _master_portfolio_state(date: dt.date) -> PortfolioSnapshot:
+    prior_date = date - dt.timedelta(days=1)
+    return PortfolioSnapshot(
+        date=prior_date,
+        as_of=dt.datetime.combine(prior_date, dt.time(16, 10), dt.timezone.utc),
+        cash=25000.0,
+        cash_weight=0.25,
+        positions={"TSLA": 120.0, "NVDA": 40.0, "AAPL": 125.0},
+        weights={"TSLA": 0.30, "NVDA": 0.20, "AAPL": 0.25},
+        equity=100000.0,
+        daily_return=0.006,
+        cumulative_return=0.04,
+        rolling_return=0.04,
+        sharpe=0.8,
+        drawdown=-0.01,
+        win_rate=0.6,
+    )
 
 
 def _text_features(date: dt.date) -> list[TextFeature]:
@@ -109,7 +90,7 @@ def run_milestone_5_graph(event_store_path: str | None = None) -> dict[str, Any]
     graph_output = build_graph_output(
         date=date,
         quant_table=_quant_table(date),
-        shadow_states=_shadow_states(date),
+        master_portfolio_state=_master_portfolio_state(date),
         text_features=_text_features(date),
         return_history=return_history,
     )

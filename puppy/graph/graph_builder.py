@@ -7,7 +7,7 @@ import datetime as dt
 import numpy as np
 import torch
 
-from puppy.common.schemas import GraphOutput, QuantFeatureTable, ShadowPortfolioState, TextFeature
+from puppy.common.schemas import GraphOutput, PortfolioSnapshot, QuantFeatureTable, TextFeature
 from puppy.graph.correlation_graph import (
     build_attention_from_adjacency,
     build_correlation_adjacency,
@@ -20,7 +20,7 @@ from puppy.graph.graph_features import build_node_features
 def build_graph_output(
     date: dt.date,
     quant_table: QuantFeatureTable,
-    shadow_states: list[ShadowPortfolioState] | None = None,
+    master_portfolio_state: PortfolioSnapshot | dict[str, object] | None = None,
     text_features: list[TextFeature] | None = None,
     return_history: dict[str, list[float]] | None = None,
     min_abs_corr: float = 0.2,
@@ -30,7 +30,7 @@ def build_graph_output(
     symbols = list(quant_table.symbols)
     node_features = build_node_features(
         quant_table=quant_table,
-        shadow_states=shadow_states,
+        master_portfolio_state=master_portfolio_state,
         text_features=text_features,
     )
     adjacency = build_correlation_adjacency(
@@ -68,7 +68,7 @@ def build_graph_output(
 def build_gat_graph_output(
     date: dt.date,
     quant_table: QuantFeatureTable,
-    shadow_states: list[ShadowPortfolioState] | None = None,
+    master_portfolio_state: PortfolioSnapshot | dict[str, object] | None = None,
     text_features: list[TextFeature] | None = None,
     return_history: dict[str, list[float]] | None = None,
     model: NumpyGATScorer | None = None,
@@ -77,7 +77,7 @@ def build_gat_graph_output(
 
     sample = build_graph_sample(
         quant_table=quant_table,
-        shadow_states=shadow_states,
+        master_portfolio_state=master_portfolio_state,
         text_features=text_features,
         return_history=return_history,
     )

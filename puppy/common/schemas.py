@@ -56,7 +56,7 @@ class AgentContext(SwarmBaseModel):
     reflection_memory: list[str] = Field(default_factory=list)
     memory_refs: list[MemoryRef] = Field(default_factory=list)
     shared_context: list[SharedContext] = Field(default_factory=list)
-    shadow_state: dict[str, Any] | None = None
+    master_portfolio_state: dict[str, Any] | None = None
     psychology_state: dict[str, Any] | None = None
     as_of: dt.datetime | None = None
     context_hash: str | None = None
@@ -277,23 +277,6 @@ class AllocationWeights(SwarmBaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ShadowPortfolioState(SwarmBaseModel):
-    date: dt.date
-    agent_id: str
-    symbol: str
-    value: float
-    roi: float
-    rolling_return: float | None = None
-    sharpe: float | None = None
-    drawdown: float | None = None
-    win_rate: float | None = None
-    as_of: dt.datetime | None = None
-    last_resolved_decision_date: dt.date | None = None
-    last_outcome_date: dt.date | None = None
-    number_of_resolved_decisions: int = 0
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
 class CausalRunContext(SwarmBaseModel):
     run_id: str
     config_path: str
@@ -385,10 +368,16 @@ class ReflectionUpdate(SwarmBaseModel):
 
 class PortfolioSnapshot(SwarmBaseModel):
     date: dt.date
+    as_of: dt.datetime | None = None
     cash: float
     positions: dict[str, float]
     weights: dict[str, float]
     equity: float
+    cash_weight: float | None = None
     daily_return: float | None = None
+    cumulative_return: float | None = None
+    rolling_return: float | None = None
+    sharpe: float | None = None
     drawdown: float | None = None
+    win_rate: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

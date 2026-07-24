@@ -5,22 +5,9 @@ from puppy.common.schemas import AllocationWeights, PortfolioSnapshot
 from puppy.portfolio_ext.allocation_engine import signals_to_target_weights
 from puppy.portfolio_ext.execution_policy import target_weights_to_trades
 from puppy.portfolio_ext.master_portfolio import MasterPortfolio
-from puppy.portfolio_ext.shadow_portfolio import ShadowPortfolio
 
 
 class PortfolioExtTest(unittest.TestCase):
-    def test_shadow_portfolio_update(self) -> None:
-        portfolio = ShadowPortfolio(initial_value=100.0)
-        state = portfolio.update(
-            agent_id="fake_tsla",
-            symbol="TSLA",
-            action_signal=1,
-            realized_return=0.05,
-            date=dt.date(2026, 1, 2),
-        )
-        self.assertAlmostEqual(state.value, 105.0)
-        self.assertAlmostEqual(state.roi, 0.05)
-
     def test_allocation_weights_sum_with_risk_rules(self) -> None:
         weights = signals_to_target_weights(
             date=dt.date(2026, 1, 2),
@@ -56,6 +43,8 @@ class PortfolioExtTest(unittest.TestCase):
         self.assertGreaterEqual(snapshot.cash, 0.0)
         self.assertAlmostEqual(snapshot.positions["TSLA"], 400.0)
         self.assertAlmostEqual(snapshot.equity, 100000.0)
+        self.assertAlmostEqual(snapshot.cash_weight, 0.6)
+        self.assertAlmostEqual(snapshot.cumulative_return, 0.0)
 
 
 if __name__ == "__main__":

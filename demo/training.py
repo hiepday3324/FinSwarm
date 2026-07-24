@@ -899,8 +899,8 @@ def _materialize_replay_records(
                         sort_keys=True,
                         default=str,
                     ),
-                    "shadow_state_json": json.dumps(
-                        agent_context.get("shadow_state"),
+                    "master_portfolio_state_json": json.dumps(
+                        agent_context.get("master_portfolio_state"),
                         sort_keys=True,
                         default=str,
                     ),

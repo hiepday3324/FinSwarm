@@ -10,7 +10,7 @@ from puppy.common.schemas import (
     ObservedFeatureTable,
     OutcomeTable,
     PendingDecision,
-    ShadowPortfolioState,
+    PortfolioSnapshot,
     TextFeature,
 )
 from puppy.graph.graph_dataset import CANONICAL_FEATURE_NAMES
@@ -47,11 +47,52 @@ def assert_context_causal(context: AgentContext, cutoff: dt.datetime) -> None:
         for item in context.shared_context
     ):
         raise AssertionError("Decision sees same-day or future shared memory")
+    assert_master_portfolio_prior(context.master_portfolio_state, cutoff)
 
 
-def assert_shadow_prior(state: ShadowPortfolioState | None, decision_date: dt.date) -> None:
-    if state and state.last_resolved_decision_date and state.last_resolved_decision_date >= decision_date:
-        raise AssertionError("ShadowPortfolio includes current/future decision outcome")
+def assert_master_portfolio_prior(
+    state: PortfolioSnapshot | dict[str, Any] | None,
+    cutoff: dt.datetime,
+) -> None:
+    if state is None:
+        return
+    payload = state.model_dump() if hasattr(state, "model_dump") else dict(state)
+    snapshot_as_of = _coerce_datetime(payload.get("as_of"))
+    if snapshot_as_of is not None and not _is_before(snapshot_as_of, cutoff):
+        raise AssertionError("MasterPortfolio snapshot must precede the decision cutoff")
+    snapshot_date = _coerce_date(payload.get("date"))
+    if snapshot_date is not None and snapshot_date >= cutoff.date():
+        raise AssertionError("MasterPortfolio snapshot must come from a prior date")
+
+
+def _coerce_datetime(value: Any) -> dt.datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, str):
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return None
+
+
+def _coerce_date(value: Any) -> dt.date | None:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, str):
+        return dt.date.fromisoformat(value[:10])
+    return None
+
+
+def _is_before(left: dt.datetime, right: dt.datetime) -> bool:
+    if left.tzinfo is None and right.tzinfo is not None:
+        left = left.replace(tzinfo=right.tzinfo)
+    elif left.tzinfo is not None and right.tzinfo is None:
+        right = right.replace(tzinfo=left.tzinfo)
+    return left < right
 
 
 def assert_linked_context_hashes(
@@ -78,7 +119,7 @@ def assert_graph_contract(feature_names: list[str], feature_matrix: Any) -> None
         raise AssertionError("Graph feature matrix width does not match feature names")
     if tuple(feature_names) != CANONICAL_FEATURE_NAMES:
         raise AssertionError(
-            "Graph H0 must use the canonical market/action/text/shadow/psychology order"
+            "Graph H0 must use the canonical market/action/text/master/psychology order"
         )
 
 

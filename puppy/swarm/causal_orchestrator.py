@@ -9,10 +9,11 @@ import numpy as np
 from puppy.common.schemas import (
     AgentContext,
     AgentOutput,
+    AllocationWeights,
     CausalRunContext,
     MarketStep,
     PendingDecision,
-    ShadowPortfolioState,
+    PortfolioSnapshot,
     TextFeature,
     FusionOutput,
     GraphOutput,
@@ -20,9 +21,15 @@ from puppy.common.schemas import (
 from puppy.fusion.gated_fusion import build_latent_fusion_output
 from puppy.graph.graph_builder import build_canonical_gat_output
 from puppy.graph.graph_dataset import build_causal_graph_sample
+from puppy.portfolio_ext.allocation_engine import fusion_to_target_weights
+from puppy.portfolio_ext.master_portfolio import portfolio_snapshot_to_context
 from puppy.swarm.context_builder import build_raw_context
+from puppy.swarm.psychology import build_psychology_state
 from puppy.training.rollout_state import canonical_json, stable_id
-from puppy.training.temporal_assertions import assert_context_causal, assert_shadow_prior
+from puppy.training.temporal_assertions import (
+    assert_context_causal,
+    assert_master_portfolio_prior,
+)
 
 
 BOOTSTRAP_ENCODER_VERSION = "sha256-frozen-encoder-v1"
@@ -42,6 +49,8 @@ class CanonicalStreamBundle:
     graph_sample: dict[str, Any]
     graph_output: GraphOutput
     fusion_output: FusionOutput
+    allocation: AllocationWeights | None = None
+    portfolio_snapshot: PortfolioSnapshot | None = None
 
 
 class DeterministicTextEncoder:
@@ -90,7 +99,7 @@ def build_context_hash(
     symbol: str,
     market_step: MarketStep,
     context: AgentContext,
-    shadow_state: ShadowPortfolioState | None,
+    master_portfolio_state: dict[str, Any] | None,
     psychology_state: dict[str, Any] | None,
     prompt_version: str,
     adapter_version: str,
@@ -115,7 +124,7 @@ def build_context_hash(
             "short": list(context.short_memory), "mid": list(context.mid_memory),
             "long": list(context.long_memory), "reflection": list(context.reflection_memory),
         },
-        "shadow_state_prior": shadow_state.model_dump(mode="json") if shadow_state else None,
+        "master_portfolio_state_prior": master_portfolio_state,
         "psychology_state_prior": psychology_state,
         "external_context_ids": sorted(
             f"{item.source_agent_id}:{item.target_agent_id}:{item.created_at}"
@@ -147,12 +156,18 @@ class CausalOrchestrator:
         run_context: CausalRunContext,
         expected_outcome_date: Any,
         split: str,
-        shadow_state: ShadowPortfolioState | None = None,
+        master_portfolio_state: Any | None = None,
         psychology_state: dict[str, Any] | None = None,
         latest_prior_reason: str | None = None,
         persisted_output: AgentOutput | None = None,
     ) -> CausalDecisionBundle:
-        assert_shadow_prior(shadow_state, market_step.date)
+        master_context = portfolio_snapshot_to_context(master_portfolio_state)
+        assert_master_portfolio_prior(master_context, run_context.current_cutoff)
+        if psychology_state is None:
+            psychology_state = build_psychology_state(
+                master_context,
+                symbol=agent.symbol,
+            )
         adapter = agent.causal_adapter
         memories, refs = adapter.retrieve(run_context.current_cutoff)
         context = AgentContext(
@@ -170,7 +185,7 @@ class CausalOrchestrator:
                 if run_context.memory_sharing_enabled
                 else []
             ),
-            shadow_state=shadow_state.model_dump(mode="json") if shadow_state else None,
+            master_portfolio_state=master_context,
             psychology_state=psychology_state,
             as_of=run_context.current_cutoff,
             metadata={"built_before_decision": True, "split": split},
@@ -180,7 +195,7 @@ class CausalOrchestrator:
             symbol=agent.symbol,
             market_step=market_step,
             context=context,
-            shadow_state=shadow_state,
+            master_portfolio_state=master_context,
             psychology_state=psychology_state,
             prompt_version=run_context.prompt_version,
             adapter_version=run_context.adapter_version,
@@ -306,13 +321,16 @@ class CausalOrchestrator:
         *,
         bundles_by_symbol: dict[str, CausalDecisionBundle],
         observed_table: Any,
-        shadow_states: dict[str, ShadowPortfolioState | None],
+        master_portfolio_state: Any | None,
         psychology_states: dict[str, dict[str, Any] | None],
         gat_model: Any,
         fusion_model: Any,
         graph_scaler: Any | None = None,
         return_history: dict[str, list[float]] | None = None,
         return_source_dates: dict[str, list[Any]] | None = None,
+        master_portfolio: Any | None = None,
+        prices: dict[str, Any] | None = None,
+        allocation_kwargs: dict[str, Any] | None = None,
         device: str = "cpu",
     ) -> CanonicalStreamBundle:
         """Execute the one canonical model path after all contexts are frozen."""
@@ -331,10 +349,12 @@ class CausalOrchestrator:
             symbol: int(bundles_by_symbol[symbol].output.signal.action_signal)
             for symbol in symbols
         }
+        master_context = portfolio_snapshot_to_context(master_portfolio_state)
+        assert_master_portfolio_prior(master_context, observed_table.as_of)
         graph_sample = build_causal_graph_sample(
             observed_table,
             action_signals,
-            shadow_states,
+            master_context,
             {symbol: bundles_by_symbol[symbol].text_feature for symbol in symbols},
             return_history,
             return_source_dates,
@@ -379,4 +399,25 @@ class CausalOrchestrator:
             device=device,
             metadata={"source": "CausalOrchestrator.run_canonical_streams"},
         )
-        return CanonicalStreamBundle(graph_sample, graph_output, fusion_output)
+        allocation = None
+        portfolio_snapshot = None
+        if master_portfolio is not None:
+            if prices is None:
+                raise ValueError("prices are required when master_portfolio is provided")
+            allocation = fusion_to_target_weights(
+                fusion_output,
+                **(allocation_kwargs or {}),
+            )
+            portfolio_snapshot = master_portfolio.apply_allocation_weights(
+                allocation=allocation,
+                prices=prices,
+                date=observed_table.date,
+                as_of=getattr(observed_table, "as_of", None),
+            )
+        return CanonicalStreamBundle(
+            graph_sample,
+            graph_output,
+            fusion_output,
+            allocation,
+            portfolio_snapshot,
+        )

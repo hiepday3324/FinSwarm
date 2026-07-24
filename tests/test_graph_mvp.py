@@ -1,7 +1,7 @@
 import datetime as dt
 import unittest
 
-from puppy.common.schemas import GraphOutput, QuantFeatureTable, ShadowPortfolioState, TextFeature
+from puppy.common.schemas import GraphOutput, PortfolioSnapshot, QuantFeatureTable, TextFeature
 from puppy.graph.correlation_graph import (
     build_attention_from_adjacency,
     build_correlation_adjacency,
@@ -16,18 +16,17 @@ class GraphMvpTest(unittest.TestCase):
         date = dt.date(2026, 1, 2)
         features = build_node_features(
             quant_table=_quant_table(date),
-            shadow_states=[
-                ShadowPortfolioState(
-                    date=date,
-                    agent_id="sector_tsla",
-                    symbol="TSLA",
-                    value=1.02,
-                    roi=0.02,
-                    drawdown=-0.01,
-                    sharpe=0.5,
-                    win_rate=1.0,
-                )
-            ],
+            master_portfolio_state=PortfolioSnapshot(
+                date=date - dt.timedelta(days=1),
+                cash=50000.0,
+                cash_weight=0.5,
+                positions={"TSLA": 500.0},
+                weights={"TSLA": 0.5},
+                equity=100000.0,
+                daily_return=0.01,
+                cumulative_return=0.02,
+                drawdown=-0.01,
+            ),
             text_features=[
                 TextFeature(
                     agent_id="sector_tsla",
@@ -44,10 +43,10 @@ class GraphMvpTest(unittest.TestCase):
         self.assertEqual(features["TSLA"]["action_signal"], 1)
         self.assertEqual(features["TSLA"]["return"], 0.02)
         self.assertEqual(features["TSLA"]["label"], 1)
-        self.assertEqual(features["TSLA"]["shadow_roi"], 0.02)
-        self.assertEqual(features["TSLA"]["shadow_drawdown"], -0.01)
-        self.assertEqual(features["TSLA"]["shadow_sharpe"], 0.5)
-        self.assertEqual(features["TSLA"]["shadow_win_rate"], 1.0)
+        self.assertEqual(features["TSLA"]["master_symbol_weight"], 0.5)
+        self.assertEqual(features["TSLA"]["master_cash_weight"], 0.5)
+        self.assertEqual(features["TSLA"]["master_daily_return"], 0.01)
+        self.assertEqual(features["TSLA"]["master_drawdown"], -0.01)
         self.assertEqual(features["TSLA"]["text_norm"], 5.0)
         self.assertEqual(features["TSLA"]["num_text_features"], 1)
 

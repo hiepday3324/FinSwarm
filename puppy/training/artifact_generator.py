@@ -21,7 +21,8 @@ from puppy.data_engine.duckdb_store import DuckDBMarketStore
 from puppy.data_engine.normalization import load_stage4_config
 from puppy.data_engine.parquet_loader import load_price_parquet
 from puppy.graph.graph_dataset import FEATURE_NAMES, build_causal_graph_sample
-from puppy.portfolio_ext.shadow_portfolio import ShadowPortfolio
+from puppy.portfolio_ext.allocation_engine import signals_to_target_weights
+from puppy.portfolio_ext.master_portfolio import MasterPortfolio
 from puppy.swarm.causal_orchestrator import (
     BOOTSTRAP_ENCODER_VERSION,
     CausalOrchestrator,
@@ -53,7 +54,7 @@ from .temporal_assertions import (
 
 
 PROMPT_VERSION = "bootstrap-decision-v1"
-GENERATOR_VERSION = "stage5-canonical-causal-artifacts-v2"
+GENERATOR_VERSION = "stage5-canonical-causal-artifacts-v3-master-portfolio"
 
 
 def _sanitized_provenance(value: dict[str, Any] | None) -> dict[str, Any]:
@@ -319,7 +320,7 @@ def generate_training_artifacts(
     root = Path(output_root) if output_root else config.repo_root / "data/training"
     output_dir = root / run_id
     feature_schema = {
-        "version": "canonical-causal-feature-schema-v2",
+        "version": "canonical-causal-feature-schema-v3-master-portfolio",
         "observed_feature_names": OBSERVED_FEATURE_NAMES,
         "observed_definitions": FEATURE_DEFINITIONS,
         "graph_feature_names": FEATURE_NAMES,
@@ -462,7 +463,8 @@ def generate_training_artifacts(
         encoder or DeterministicTextEncoder(),
         text_score_head=text_score_head,
     )
-    shadow = ShadowPortfolio(initial_value=1.0)
+    master_portfolio = MasterPortfolio(initial_cash=100000.0)
+    latest_master_snapshot = None
     latest_reasons: dict[str, tuple[dt.date, str]] = {}
     pending_by_id: dict[str, PendingDecision] = {}
     pending_by_date: dict[dt.date, list[str]] = defaultdict(list)
@@ -480,6 +482,7 @@ def generate_training_artifacts(
     def process_cycle(date: dt.date, create_decisions: bool) -> None:
         nonlocal days_without_news, days_without_filings
         nonlocal last_fully_completed_date, journal_gap_seen
+        nonlocal latest_master_snapshot
         step = store.get_point_in_time_market_step(date, list(config.symbols), common_dates)
         assert_market_step_causal(step)
         run_context = CausalRunContext(
@@ -523,15 +526,6 @@ def generate_training_artifacts(
             )
             assert_outcome_alignment(outcome, pending)
             artifacts["outcomes"].append(_outcome_row(outcome))
-            shadow.resolve_outcome(
-                agent_id=pending.agent_id,
-                symbol=pending.symbol,
-                action_signal=pending.action_signal,
-                realized_return=outcome.asset_return,
-                decision_date=pending.decision_date,
-                outcome_date=date,
-                as_of=step.as_of,
-            )
             reflection = agents[pending.symbol].learn_from_outcome(pending, outcome, run_context)
             finalized_reflections.append(reflection)
             artifacts["reflection_updates"].append(_reflection_row(reflection))
@@ -561,13 +555,14 @@ def generate_training_artifacts(
         bundles = {}
         text_by_symbol = {}
         action_signals = {}
-        shadow_states = {}
         psychology_states = {}
         text_scores = {}
         completed_symbols: list[str] = []
         for symbol_index, (symbol, agent) in enumerate(agents.items()):
-            prior_state = shadow.get_state(agent.agent_id, symbol)
-            psychology = build_psychology_state(prior_state)
+            psychology = build_psychology_state(
+                latest_master_snapshot,
+                symbol=symbol,
+            )
             prior_reason = latest_reasons.get(agent.agent_id)
             latest_reason = prior_reason[1] if prior_reason and prior_reason[0] < date else None
             journal_record = (
@@ -592,7 +587,7 @@ def generate_training_artifacts(
                 run_context=run_context,
                 expected_outcome_date=next_date,
                 split=str(current_split),
-                shadow_state=prior_state,
+                master_portfolio_state=latest_master_snapshot,
                 psychology_state=psychology,
                 latest_prior_reason=latest_reason,
                 persisted_output=persisted_output,
@@ -639,7 +634,6 @@ def generate_training_artifacts(
             bundles[symbol] = bundle
             text_by_symbol[symbol] = bundle.text_feature
             action_signals[symbol] = bundle.output.signal.action_signal
-            shadow_states[symbol] = prior_state
             psychology_states[symbol] = psychology
             text_scores[symbol] = bundle.text_score
             latest_reasons[agent.agent_id] = (date, bundle.output.signal.reason)
@@ -663,7 +657,7 @@ def generate_training_artifacts(
         graph = build_causal_graph_sample(
             observed,
             action_signals,
-            shadow_states,
+            latest_master_snapshot,
             text_by_symbol,
             return_history,
             return_source_dates,
@@ -687,6 +681,19 @@ def generate_training_artifacts(
         }
         artifacts["graph_samples"].append(graph_row)
         _atomic_graph_shard(graph_shard_dir / f"{date.isoformat()}.npz", graph_row)
+
+        allocation = signals_to_target_weights(
+            date=date,
+            symbols=list(config.symbols),
+            action_signals=action_signals,
+            max_weight=0.35,
+        )
+        latest_master_snapshot = master_portfolio.apply_target_weights(
+            date=date,
+            prices=step.prices,
+            target_weights=allocation,
+            as_of=step.as_of,
+        )
 
         for symbol, bundle in bundles.items():
             bundle.pending.graph_sample_id = graph_sample_id
@@ -739,13 +746,11 @@ def generate_training_artifacts(
             "resolved_decision_ids": sorted(resolved),
             "reflection_ids": sorted(row["reflection_id"] for row in artifacts["reflection_updates"]),
             "memory_checkpoint_references": {"mode": "deterministic_replay", "replay_through": date.isoformat()},
-            "shadow_portfolio_state": {
-                symbol: (
-                    shadow.get_state(agent.agent_id, symbol).model_dump(mode="json")
-                    if shadow.get_state(agent.agent_id, symbol) else None
-                )
-                for symbol, agent in agents.items()
-            },
+            "master_portfolio_state": (
+                latest_master_snapshot.model_dump(mode="json")
+                if latest_master_snapshot is not None
+                else None
+            ),
             "artifact_counts": {
                 key: len(value) for key, value in artifacts.items() if isinstance(value, list)
             },
@@ -789,7 +794,7 @@ def generate_training_artifacts(
         "future_price_violations": 0,
         "future_event_violations": 0,
         "same_day_reflection_violations": 0,
-        "shadow_timing_violations": 0,
+        "master_portfolio_timing_violations": 0,
         "graph_forbidden_feature_violations": 0,
         "outcome_alignment_violations": 0,
         "context_hash_mismatches": 0,

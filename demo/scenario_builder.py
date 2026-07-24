@@ -65,7 +65,11 @@ def build_scenarios(
             context = records[central]["context_snapshot"].get("agent_context", {})
             completeness = sum(
                 bool(context.get(field))
-                for field in ("memory_refs", "psychology_state", "shadow_state")
+                for field in (
+                    "memory_refs",
+                    "psychology_state",
+                    "master_portfolio_state",
+                )
             ) / 3.0
             score = (
                 5.0 * attention_shift
