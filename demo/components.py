@@ -64,6 +64,7 @@ def inject_css() -> None:
         .pipeline-step:nth-child(2), .pipeline-step:nth-child(5) { border-top-color: var(--coral); }
         .pipeline-step:nth-child(3), .pipeline-step:nth-child(6) { border-top-color: var(--gold); }
         .section-band { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin: 7px 0 10px; }
+        .map-date-strip { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; margin: 4px 0 10px; color: var(--ink); font-size: 0.88rem; }
         .agent-summary { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; padding: 12px; min-height: 238px; }
         .agent-summary.selected { border: 2px solid var(--teal); padding: 11px; }
         .agent-symbol { font-size: 1.2rem; font-weight: 780; }
@@ -83,6 +84,18 @@ def inject_css() -> None:
         [data-testid="stMetricValue"] * { color: var(--ink) !important; }
         [data-testid="stWidgetLabel"],
         [data-testid="stWidgetLabel"] * { color: var(--ink) !important; font-weight: 700; }
+        [role="radiogroup"] label,
+        [role="radiogroup"] label *,
+        [data-testid="stRadio"] label,
+        [data-testid="stRadio"] label *,
+        [data-testid="stRadio"] p,
+        [data-testid="stRadio"] span,
+        [data-testid="stCheckbox"] label,
+        [data-testid="stCheckbox"] label *,
+        [data-testid="stSwitch"] label,
+        [data-testid="stSwitch"] label *,
+        [data-testid="stSwitch"] p,
+        [data-testid="stSwitch"] span { color: var(--ink) !important; }
         .stButton > button { background: var(--ink); color: #ffffff !important; border: 1px solid var(--ink); }
         .stButton > button:hover { background: var(--teal); color: #ffffff !important; border-color: var(--teal); }
         .stButton > button *,

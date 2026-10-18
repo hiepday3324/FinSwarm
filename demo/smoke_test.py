@@ -22,7 +22,13 @@ from demo.constants import (
     TRAIN_START,
 )
 from demo.data_loader import ReplayStore
-from demo.graph_visualization import attention_views, edge_records
+from demo.graph_visualization import (
+    MODE_CURRENT,
+    attention_views,
+    dominant_attention_path,
+    edge_records,
+    make_network_figure,
+)
 from demo.inference import FrozenReplayEngine
 from demo.training import load_demo_config, protected_snapshot
 
@@ -165,6 +171,8 @@ def run_smoke_test(
         previous_date=previous["date"],
     )
     assert len(records) == 9
+    assert sum(1 for item in records if item["is_self_loop"]) == 3
+    assert sum(1 for item in records if not item["is_self_loop"]) == 6
     for item in records:
         target = NODE_ORDER.index(item["target"])
         source = NODE_ORDER.index(item["source"])
@@ -176,6 +184,38 @@ def run_smoke_test(
     assert np.array_equal(heatmap_previous, previous_matrix)
     assert np.array_equal(heatmap_current, matrix)
     assert np.allclose(heatmap_delta, matrix - previous_matrix)
+    path = dominant_attention_path(matrix, NODE_ORDER)
+    assert len(path["symbols"]) in {2, 3}
+    assert all(source != target for source, target in path["edges"])
+    action_rows = {row["symbol"]: row for row in store.records_for_date(output["date"])}
+    figure = make_network_figure(
+        matrix,
+        previous_matrix,
+        NODE_ORDER,
+        text_probabilities={
+            symbol: float(output["text_probability"][NODE_ORDER.index(symbol)])
+            for symbol in NODE_ORDER
+        },
+        graph_probabilities={
+            symbol: float(output["graph_probability"][NODE_ORDER.index(symbol)])
+            for symbol in NODE_ORDER
+        },
+        fusion_probabilities={
+            symbol: float(output["fusion_probability"][NODE_ORDER.index(symbol)])
+            for symbol in NODE_ORDER
+        },
+        fusion_deltas={symbol: 0.0 for symbol in NODE_ORDER},
+        actions={symbol: str(action_rows[symbol]["decision"]) for symbol in NODE_ORDER},
+        selected_symbols={"AAPL"},
+        head_label="Mean across heads",
+        replay_date=output["date"],
+        previous_date=previous["date"],
+        mode=MODE_CURRENT,
+    )
+    edge_traces = [trace for trace in figure.data if getattr(trace, "meta", {}).get("kind") == "edge"]
+    assert len(edge_traces) == 9
+    assert sum(bool(trace.meta["is_self_loop"]) for trace in edge_traces) == 3
+    assert any(trace.meta["highlighted"] for trace in edge_traces)
 
     decomposition = engine.fusion_decomposition(output)
     for row in decomposition:
@@ -213,6 +253,9 @@ def run_smoke_test(
         "attention_shape": list(attention_heads.shape),
         "attention_normalization_axis": -1,
         "source_target_convention": "alpha[target, source] = source -> target",
+        "influence_map_edge_count": len(edge_traces),
+        "dominant_path": " -> ".join(path["symbols"]),
+        "dominant_path_score": path["score"],
         "model_hashes_unchanged": before_hashes == after_hashes,
         "save_load_max_abs_delta": {
             name: max(values[name] for values in prediction_deltas.values())

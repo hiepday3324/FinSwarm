@@ -26,10 +26,15 @@ from demo.components import (
 from demo.constants import DEFAULT_BUNDLE_DIR, DISPLAY_ORDER, NODE_ORDER, UNAVAILABLE
 from demo.data_loader import ReplayStore
 from demo.graph_visualization import (
+    DISPLAY_MODES,
+    MODE_CURRENT,
+    MODE_DOMINANT,
     edge_records,
-    largest_attention_changes,
+    attention_summary,
+    dominant_attention_path,
     make_attention_heatmaps,
     make_network_figure,
+    top_influence_rows,
 )
 from demo.inference import FrozenReplayEngine
 
@@ -54,6 +59,24 @@ def _display_values(values: np.ndarray) -> dict[str, float]:
     return {symbol: float(values[_symbol_index(symbol)]) for symbol in DISPLAY_ORDER}
 
 
+def _highlight_selected_rows(data: pd.DataFrame, selected_symbols: set[str]) -> pd.DataFrame:
+    if not selected_symbols:
+        return pd.DataFrame("", index=data.index, columns=data.columns)
+    return pd.DataFrame(
+        [
+            [
+                "background-color: #ecf7f4; color: #172126; font-weight: 700"
+                if str(index) in selected_symbols
+                else ""
+                for _ in data.columns
+            ]
+            for index in data.index
+        ],
+        index=data.index,
+        columns=data.columns,
+    )
+
+
 def _initialize_state(store: ReplayStore) -> None:
     scenarios = store.scenarios()
     default_index = store.date_index(scenarios[0]["date"]) if scenarios else len(store.dates) - 1
@@ -75,7 +98,7 @@ def _initialize_state(store: ReplayStore) -> None:
         st.session_state.date_selector = store.dates[bounded].isoformat()
 
 
-def _controls(store: ReplayStore, engine: FrozenReplayEngine) -> tuple[str, float]:
+def _controls(store: ReplayStore) -> float:
     scenarios = store.scenarios()
     scenario_by_label = {
         f"{item['central_symbol']}-centred | {item['date']}": item for item in scenarios
@@ -110,7 +133,7 @@ def _controls(store: ReplayStore, engine: FrozenReplayEngine) -> tuple[str, floa
         st.session_state.playing = value and st.session_state.date_index < len(store.dates) - 1
 
     scenario_options = ["Manual train date", *scenario_by_label]
-    control_row = st.columns([2.0, 1.65, 0.75, 0.62, 0.62, 0.62, 1.35, 1.35])
+    control_row = st.columns([2.0, 1.65, 0.75, 0.62, 0.62, 0.62, 1.35])
     with control_row[0]:
         st.selectbox(
             "Curated scenario",
@@ -138,12 +161,6 @@ def _controls(store: ReplayStore, engine: FrozenReplayEngine) -> tuple[str, floa
         st.write("")
         st.button("Next", on_click=move, args=(1,), width="stretch")
     with control_row[6]:
-        head_options = [
-            "Mean across heads",
-            *[f"Head {index + 1}" for index in range(engine.graph_model.num_heads)],
-        ]
-        head_label = st.selectbox("Attention head", head_options)
-    with control_row[7]:
         capital = float(
             st.number_input(
                 "Portfolio capital",
@@ -154,91 +171,200 @@ def _controls(store: ReplayStore, engine: FrozenReplayEngine) -> tuple[str, floa
                 format="%.0f",
             )
         )
-    return head_label, capital
+    return capital
 
 
 def _render_news_and_graph(
     store: ReplayStore,
+    engine: FrozenReplayEngine,
     output: dict[str, Any],
     previous: dict[str, Any],
     records: dict[str, dict[str, Any]],
     *,
-    head_label: str,
     previous_date: str | None,
-) -> None:
+) -> set[str]:
     date = output["date"]
     news = store.news_for_date(date)
     selected_news = st.session_state.selected_news_group
     selected_symbols: set[str] = set()
+    selected_news_item: dict[str, Any] | None = None
     if selected_news is not None:
         match = next((item for item in news if item["news_group_id"] == selected_news), None)
         if match is not None:
+            selected_news_item = match
             selected_symbols.update(match["agents_received"])
     if st.session_state.selected_symbol:
         selected_symbols.add(st.session_state.selected_symbol)
 
+    st.subheader("Historical News Routing")
+    with st.container(height=260, border=False):
+        if not news:
+            st.info("No causally included news events are stored for this replay date.")
+        for index, item in enumerate(news):
+            active = item["news_group_id"] == selected_news
+            label = ("Selected | " if active else "") + str(item["headline"])
+            if st.button(
+                label,
+                key=f"news_{date}_{index}_{item['news_group_id']}",
+                width="stretch",
+            ):
+                st.session_state.selected_news_group = (
+                    None if active else item["news_group_id"]
+                )
+                st.session_state.selected_symbol = None
+                st.rerun()
+            routed = ", ".join(item["agents_received"]) or UNAVAILABLE
+            not_routed = ", ".join(
+                symbol for symbol in DISPLAY_ORDER if symbol not in item["agents_received"]
+            ) or "None"
+            published = item["published_at"].isoformat() if item["published_at"] else UNAVAILABLE
+            cutoff = str(item.get("decision_cutoff") or UNAVAILABLE)
+            causal = "Causally available" if item["causally_available"] else "Unavailable at cutoff"
+            st.markdown(
+                f"""
+                <div class="section-band">
+                  <strong>{item['source']}</strong><br>
+                  <span class="news-meta">Published: {published}<br>
+                  Decision cutoff: {cutoff}<br>
+                  Related symbols: {', '.join(item['related_symbols']) or UNAVAILABLE}<br>
+                  Routed to: {routed}<br>Not routed to: {not_routed}<br>
+                  Status: {causal}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    if selected_news_item is not None:
+        st.caption(
+            "Highlighting Agents that received the selected stored news item. "
+            "Attention values still reflect the complete replay state."
+        )
+
+    st.markdown("### Decision Influence Map &mdash; GAT")
+    previous_label = previous_date or "No previous eligible replay date"
+    st.markdown(
+        f'<div class="map-date-strip"><strong>Previous:</strong> {previous_label} '
+        f'&nbsp;&nbsp; <strong>Current:</strong> {date}</div>',
+        unsafe_allow_html=True,
+    )
+    left, right = st.columns([0.60, 0.40], gap="large")
+    head_options = [
+        "Mean across heads",
+        *[f"Head {index + 1}" for index in range(engine.graph_model.num_heads)],
+    ]
+    with right:
+        head_label = st.radio(
+            "Attention head",
+            head_options,
+            horizontal=True,
+            key="attention_head_selector",
+        )
     current_attention = selected_head_matrix(output, head_label)
     previous_attention = selected_head_matrix(previous, head_label)
-    probabilities = _display_values(output["fusion_probability"])
+    text_probabilities = _display_values(output["text_probability"])
+    graph_probabilities = _display_values(output["graph_probability"])
+    fusion_probabilities = _display_values(output["fusion_probability"])
+    if previous_date is None:
+        fusion_deltas = {symbol: 0.0 for symbol in DISPLAY_ORDER}
+    else:
+        previous_fusion = _display_values(previous["fusion_probability"])
+        fusion_deltas = {
+            symbol: fusion_probabilities[symbol] - previous_fusion[symbol]
+            for symbol in DISPLAY_ORDER
+        }
     actions = {symbol: str(records[symbol]["decision"]) for symbol in DISPLAY_ORDER}
 
-    left, right = st.columns([0.82, 1.58], gap="large")
     with left:
-        st.subheader("Historical News")
-        with st.container(height=515, border=False):
-            if not news:
-                st.info("No causally included news events are stored for this replay date.")
-            for index, item in enumerate(news):
-                active = item["news_group_id"] == selected_news
-                label = ("Selected | " if active else "") + str(item["headline"])
-                if st.button(
-                    label,
-                    key=f"news_{date}_{index}_{item['news_group_id']}",
-                    width="stretch",
-                ):
-                    st.session_state.selected_news_group = (
-                        None if active else item["news_group_id"]
-                    )
-                    st.session_state.selected_symbol = None
-                    st.rerun()
-                routed = ", ".join(item["agents_received"]) or UNAVAILABLE
-                not_routed = ", ".join(
-                    symbol for symbol in DISPLAY_ORDER if symbol not in item["agents_received"]
-                ) or "None"
-                published = item["published_at"].isoformat() if item["published_at"] else UNAVAILABLE
-                cutoff = str(item.get("decision_cutoff") or UNAVAILABLE)
-                causal = "Causally available" if item["causally_available"] else "Unavailable at cutoff"
-                st.markdown(
-                    f"""
-                    <div class="section-band">
-                      <strong>{item['source']}</strong><br>
-                      <span class="news-meta">Published: {published}<br>
-                      Decision cutoff: {cutoff}<br>
-                      Related symbols: {', '.join(item['related_symbols']) or UNAVAILABLE}<br>
-                      Routed to: {routed}<br>Not routed to: {not_routed}<br>
-                      Status: {causal}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-    with right:
-        st.subheader("GAT Attention Network")
+        control_cols = st.columns([1.55, 0.75], gap="medium")
+        with control_cols[0]:
+            mode = st.radio(
+                "Display mode",
+                DISPLAY_MODES,
+                horizontal=True,
+                key="attention_display_mode",
+            )
+        with control_cols[1]:
+            show_edge_values = st.toggle("Show edge values", value=False)
         figure = make_network_figure(
             current_attention,
             previous_attention,
             NODE_ORDER,
-            probabilities=probabilities,
+            text_probabilities=text_probabilities,
+            graph_probabilities=graph_probabilities,
+            fusion_probabilities=fusion_probabilities,
+            fusion_deltas=fusion_deltas,
             actions=actions,
             selected_symbols=selected_symbols,
             head_label=head_label,
             replay_date=date,
             previous_date=previous_date,
+            mode=mode,
+            show_edge_values=show_edge_values,
         )
         st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
         st.caption(
             "Rows are targets; columns are sources. Each displayed alpha is a "
             "sample-specific attention coefficient from frozen trained GAT parameters."
         )
+    with right:
+        st.plotly_chart(
+            make_attention_heatmaps(
+                previous_attention, current_attention, NODE_ORDER, head_label=head_label
+            ),
+            width="stretch",
+            config={"displayModeBar": False},
+        )
+        st.caption("Rows: targets | Columns: sources | Softmax normalization axis: sources")
+        records_for_edges = edge_records(
+            current_attention,
+            previous_attention,
+            NODE_ORDER,
+            head_label=head_label,
+            replay_date=date,
+            previous_date=previous_date,
+        )
+        path = dominant_attention_path(current_attention, NODE_ORDER)
+        path_edges = set(path["edges"]) if mode == MODE_DOMINANT else set()
+        rows = [
+            {
+                "Source -> Target": f"{item['source']} -> {item['target']}",
+                "Current alpha": item["current_alpha"],
+                "Previous alpha": item["previous_alpha"],
+                "Delta": item["delta"],
+                "Current rank": item["current_rank"],
+                "Delta rank": item["absolute_delta_rank"],
+                "Trend": item["trend"],
+            }
+            for item in top_influence_rows(
+                records_for_edges,
+                mode=mode,
+                path_edges=path_edges,
+                limit=5,
+            )
+        ]
+        st.markdown("**Top Influences**")
+        st.dataframe(
+            pd.DataFrame(rows).style.format(
+                {
+                    "Current alpha": "{:.3f}",
+                    "Previous alpha": "{:.3f}",
+                    "Delta": "{:+.3f}",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        statements, stats = attention_summary(records_for_edges, mode=mode, path=path)
+        st.markdown("**Attention Summary**")
+        for statement in statements:
+            st.markdown(f"- {statement}")
+        stat_cols = st.columns(2)
+        stat_cols[0].metric("Strongest current edge", stats["strongest_current_edge"])
+        stat_cols[1].metric("Stable edges", stats["stable_edges"])
+        stat_cols[0].metric("Largest increase", stats["largest_increase"])
+        stat_cols[1].metric("Largest decrease", stats["largest_decrease"])
+        if mode == MODE_DOMINANT:
+            st.metric("Highlighted path edges", stats["highlighted_path_edges"])
+    return selected_symbols
 
 
 def _agent_context_sections(
@@ -333,6 +459,7 @@ def _render_agents(
 def _render_stream_outputs(
     output: dict[str, Any],
     previous: dict[str, Any] | None,
+    selected_symbols: set[str],
 ) -> None:
     text_rows: list[dict[str, Any]] = []
     graph_rows: list[dict[str, Any]] = []
@@ -369,8 +496,12 @@ def _render_stream_outputs(
     left, right = st.columns(2, gap="large")
     with left:
         st.subheader("Text Stream predictive score")
+        text_frame = pd.DataFrame(text_rows).set_index("Symbol")
         st.dataframe(
-            pd.DataFrame(text_rows).set_index("Symbol").style.format(
+            text_frame.style.apply(
+                lambda frame: _highlight_selected_rows(frame, selected_symbols),
+                axis=None,
+            ).format(
                 {
                     "Text probability": "{:.3f}",
                     "Text logit": "{:+.3f}",
@@ -383,8 +514,12 @@ def _render_stream_outputs(
     with right:
         st.subheader("Graph Stream output")
         st.caption("Produced after cross-stock message passing.")
+        graph_frame = pd.DataFrame(graph_rows).set_index("Symbol")
         st.dataframe(
-            pd.DataFrame(graph_rows).set_index("Symbol").style.format(
+            graph_frame.style.apply(
+                lambda frame: _highlight_selected_rows(frame, selected_symbols),
+                axis=None,
+            ).format(
                 {
                     "Graph probability": "{:.3f}",
                     "Graph logit": "{:+.3f}",
@@ -394,56 +529,6 @@ def _render_stream_outputs(
             ),
             width="stretch",
         )
-
-
-def _render_attention_detail(
-    output: dict[str, Any],
-    previous: dict[str, Any],
-    *,
-    head_label: str,
-    previous_date: str | None,
-) -> None:
-    current_matrix = selected_head_matrix(output, head_label)
-    previous_matrix = selected_head_matrix(previous, head_label)
-    st.subheader("Attention Shift Between Replay Dates")
-    st.plotly_chart(
-        make_attention_heatmaps(
-            previous_matrix, current_matrix, NODE_ORDER, head_label=head_label
-        ),
-        width="stretch",
-        config={"displayModeBar": False},
-    )
-    st.caption("Rows: targets | Columns: sources | Softmax normalization axis: sources")
-    changes = largest_attention_changes(
-        edge_records(
-            current_matrix,
-            previous_matrix,
-            NODE_ORDER,
-            head_label=head_label,
-            replay_date=output["date"],
-            previous_date=previous_date,
-        )
-    )
-    table = pd.DataFrame(
-        [
-            {
-                "Edge": f"{item['source']} -> {item['target']}",
-                "Previous": item["previous_alpha"],
-                "Current": item["current_alpha"],
-                "Delta": item["delta"],
-                "Absolute delta": item["absolute_delta"],
-                "Head": item["attention_head"],
-            }
-            for item in changes
-        ]
-    )
-    st.dataframe(
-        table.style.format(
-            {"Previous": "{:.4f}", "Current": "{:.4f}", "Delta": "{:+.4f}", "Absolute delta": "{:.4f}"}
-        ),
-        width="stretch",
-        hide_index=True,
-    )
 
 
 def _feature_frame(output: dict[str, Any]) -> pd.DataFrame:
@@ -526,6 +611,7 @@ def _render_fusion_and_allocation(
     previous_records: dict[str, dict[str, Any]] | None,
     *,
     capital: float,
+    selected_symbols: set[str],
 ) -> None:
     coefficients = engine.coefficients
     st.subheader("Scalar Fusion")
@@ -561,8 +647,12 @@ def _render_fusion_and_allocation(
                 "Probability delta": row["fusion_probability"] - previous_probability,
             }
         )
+    fusion_frame = pd.DataFrame(fusion_table).set_index("Symbol")
     st.dataframe(
-        pd.DataFrame(fusion_table).set_index("Symbol").style.format(
+        fusion_frame.style.apply(
+            lambda frame: _highlight_selected_rows(frame, selected_symbols),
+            axis=None,
+        ).format(
             {
                 "Intercept": "{:+.4f}",
                 "Text term": "{:+.4f}",
@@ -679,8 +769,12 @@ def _render_fusion_and_allocation(
             "Weight delta": allocation["cash_weight"] - previous_weight_map["Cash"],
         }
     )
+    allocation_frame = pd.DataFrame(allocation_rows).set_index("Symbol")
     st.dataframe(
-        pd.DataFrame(allocation_rows).set_index("Symbol").style.format(
+        allocation_frame.style.apply(
+            lambda frame: _highlight_selected_rows(frame, selected_symbols),
+            axis=None,
+        ).format(
             {
                 "Fusion probability": "{:.3f}",
                 "Action multiplier": "{:.1f}",
@@ -701,7 +795,7 @@ def main() -> None:
     store, engine = load_runtime()
     _initialize_state(store)
     render_header()
-    head_label, capital = _controls(store, engine)
+    capital = _controls(store)
     render_pipeline_strip()
 
     index = int(st.session_state.date_index)
@@ -733,22 +827,16 @@ def main() -> None:
         "FROZEN" if engine.state_hashes() == engine.startup_state_hashes else "CHANGED",
     )
 
-    _render_news_and_graph(
+    selected_symbols = _render_news_and_graph(
         store,
+        engine,
         output,
         previous_for_attention,
         records,
-        head_label=head_label,
         previous_date=previous_date,
     )
     _render_agents(store, output, previous_output, records)
-    _render_stream_outputs(output, previous_output)
-    _render_attention_detail(
-        output,
-        previous_for_attention,
-        head_label=head_label,
-        previous_date=previous_date,
-    )
+    _render_stream_outputs(output, previous_output, selected_symbols)
     _render_graph_features(output, previous_for_attention, store.feature_schema)
     _render_fusion_and_allocation(
         engine,
@@ -757,6 +845,7 @@ def main() -> None:
         records,
         previous_records,
         capital=capital,
+        selected_symbols=selected_symbols,
     )
     render_disclaimer()
     st.caption(
